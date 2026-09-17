@@ -43,8 +43,8 @@ flowchart LR
 ## 快速启动
 
 ```powershell
-git clone <你的仓库地址>
-cd PaperReader-RAG
+git clone https://github.com/sanchuanmingyue/RAG.git
+cd RAG
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -72,7 +72,7 @@ uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
 - 多篇论文对比：先生成单篇阅读卡片，再基于卡片生成 Markdown 对比表
 - 支持将最近结果、来源片段、阅读卡片和会话记录导出为 Markdown 或 JSON
 - Evaluator 支持空来源拒答，并可通过 `RETRIEVAL_MAX_DISTANCE` 配置检索距离阈值
-- 增加“向量数据库学习”页面，可观察 chunk、metadata、top_k、distance
+- 提供检索调试页面，可观察 chunk、metadata、Top-K 与相似度距离
 
 ## 项目结构
 
@@ -113,28 +113,9 @@ uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
     └── paper_compare.py
 ```
 
-## 快速开始
+## 配置与运行
 
-你的 conda 环境在：
-
-```text
-E:\anaconda\envs\longchain
-```
-
-安装依赖：
-
-```powershell
-cd E:\longchain\RAG
-& 'E:\anaconda\envs\longchain\python.exe' -m pip install -r requirements.txt
-```
-
-复制环境变量文件：
-
-```powershell
-copy .env.example .env
-```
-
-然后在 `.env` 中配置：
+在 `.env` 中配置：
 
 ```text
 LLM_API_KEY
@@ -146,7 +127,7 @@ EMBEDDING_MODEL
 ```
 
 生成模型支持按顺序自动切换的阿里云模型池。所有模型复用同一个 DashScope API Key 和
-OpenAI 兼容地址；模型 ID 由你按照模型服务控制台中的赠送额度自行填写：
+OpenAI 兼容地址，模型 ID 通过模型服务控制台配置：
 
 ```text
 LLM_API_KEY=你的阿里云百炼_API_Key
@@ -181,9 +162,7 @@ RAG_ANYTHING_VISION_MODEL=PaddlePaddle/PaddleOCR-VL-1.5
 启动 FastAPI（推荐的服务入口）：
 
 ```powershell
-cd E:\longchain\RAG
-& 'E:\anaconda\envs\longchain\python.exe' -m uvicorn api.main:app `
-  --host 127.0.0.1 --port 8000 --reload
+uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 启动后访问：
@@ -195,8 +174,7 @@ cd E:\longchain\RAG
 Streamlit 现在是可选的交互界面，和 FastAPI 共用 `backend/services.py`，可独立启动：
 
 ```powershell
-cd E:\longchain\RAG
-& 'E:\anaconda\envs\longchain\python.exe' -m streamlit run app.py
+streamlit run app.py
 ```
 
 主界面采用“固定文件侧边栏 + 双栏阅读区”：左侧上传、选择论文和切换检索范围，主区域左栏进行
@@ -269,7 +247,7 @@ curl.exe -N -X POST "http://127.0.0.1:8000/api/v1/chat/stream" `
 5. 进入 `Tools` 生成阅读笔记、多论文对比或导出结果。
 6. 在“Agent 工作台”中输入“总结这篇论文”“比较选中的论文”“解释刚才的来源”“导出 Markdown”等指令。
 7. 在左侧选择多篇论文后，进入“多论文对比与导出”生成对比表或导出结果。
-8. 打开侧边栏中的“向量数据库学习”，观察 Chroma 中的 chunk 和检索结果。
+8. 打开检索调试页面，查看 Chroma 中的 chunk、元数据和排序结果。
 
 ## Agent 架构
 
@@ -286,40 +264,6 @@ curl.exe -N -X POST "http://127.0.0.1:8000/api/v1/chat/stream" `
 
 核心入口是 `backend/agent.py` 中的 `ResearchAgent`。它不是复杂的自主规划 Agent，而是面向论文阅读场景的可控工具调度器，优先保证结果可解释、可追溯。
 
-## 学习 RAG 数据库
-
-重点看这两个文件：
-
-```text
-backend/vector_store.py
-docs/rag_vector_database.md
-```
-
-你需要理解：
-
-- 向量数据库中一条记录由 `id`、`document`、`embedding`、`metadata` 组成。
-- `metadata` 负责保存来源信息，例如 `paper_id`、`file_name`、`page`、`chunk_id`。
-- 用户问题也要先转成 embedding，然后才能和库里的 chunk 向量做相似度检索。
-- `top_k` 控制返回多少个相关 chunk。
-- `distance` 通常越小越相关，但要结合文本内容判断。
-- `paper_id` 过滤可以避免多篇论文检索时串文献。
-
-## 建议学习顺序
-
-1. 先读 `backend/text_splitter.py`，理解 chunk 是怎么来的。
-2. 再读 `backend/embeddings.py`，理解文本如何变成向量。
-3. 重点读 `backend/vector_store.py`，理解 Chroma 如何存储和检索。
-4. 打开“向量数据库学习”页面，观察真实数据。
-5. 最后读 `backend/rag_chain.py`，理解检索结果如何交给大模型回答。
-
-## 后续扩展建议
-
-- 增加论文标题、作者、年份的元数据抽取
-- 增加按论文过滤的长期聊天历史
-- 增加 Word、Excel 导出
-- 增加 RAG 评估集，检查回答准确性和引用页码准确性
-- 增加 query rewrite、hybrid search、rerank 和章节感知切分
-
 ## Open RAG Benchmark 离线评测
 
 项目提供了独立的离线评测入口，不会使用默认的 `paper_reader_chunks` collection，也不会把
@@ -332,8 +276,7 @@ docs/rag_vector_database.md
 2. 运行 100 条纯文本题的 baseline：
 
 ```powershell
-cd E:\longchain\RAG
-& 'E:\anaconda\envs\longchain\python.exe' scripts\run_open_rag_bench.py `
+python scripts\run_open_rag_bench.py `
   --dataset-root data\benchmarks\open_ragbench `
   --collection open_ragbench_hybrid_top5 `
   --run-name hybrid_top5 `
@@ -355,7 +298,7 @@ cd E:\longchain\RAG
 实际使用的模型以及模型池切换次数：
 
 ```powershell
-& 'E:\anaconda\envs\longchain\python.exe' scripts\run_open_rag_bench.py `
+python scripts\run_open_rag_bench.py `
   --dataset-root data\benchmarks\open_ragbench `
   --collection open_ragbench_section_index_v2 `
   --max-cases 100 --max-documents 200 --generation-max-cases 5 `
@@ -402,7 +345,7 @@ API reranker 预热只检查配置，不发请求、不消耗额度；仅当切�
 随机种子一致：
 
 ```powershell
-& 'E:\anaconda\envs\longchain\python.exe' scripts\run_open_rag_bench.py `
+python scripts\run_open_rag_bench.py `
   --dataset-root data\benchmarks\open_ragbench `
   --collection open_ragbench_section_index_v2 `
   --run-name section_index_v2 `
