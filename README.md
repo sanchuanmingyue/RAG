@@ -149,14 +149,15 @@ LLM_MODEL=glm-5.2
 EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
 EMBEDDING_MODEL=BAAI/bge-m3
 VISION_BASE_URL=https://api.siliconflow.cn/v1
-RAG_ANYTHING_VISION_MODEL=PaddlePaddle/PaddleOCR-VL-1.5
+RAG_ANYTHING_VISION_MODEL=Qwen/Qwen3-VL-8B-Instruct
 ```
 
 两者的 Key 分别写入 `LLM_API_KEY` 和 `EMBEDDING_API_KEY`，不要互换。更换 embedding 模型时必须使用
 新的 Chroma collection 并重新索引，不能复用其他模型生成的向量。
 当视觉与 embedding 使用相同的硅基流动地址时，系统会自动让视觉模型复用 `EMBEDDING_API_KEY`；
 无需再维护第二个硅基流动 Key。
-`PaddlePaddle/PaddleOCR-VL-1.5` 主要用于论文页面的 OCR、版面、公式与表格内容提取；
+MinerU pipeline 负责论文页面的 OCR、版面、公式与表格结构提取；
+`Qwen/Qwen3-VL-8B-Instruct` 负责图表语义描述并生成 RAG-Anything 所需的结构化结果，
 通用文本问答仍使用上面的阿里云 `LLM_MODELS` 模型池。
 
 启动 FastAPI（推荐的服务入口）：

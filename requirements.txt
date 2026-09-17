@@ -8,4 +8,8 @@ python-dotenv>=1.0.1
 pymupdf>=1.24.0
 chromadb>=0.5.0
 sentence-transformers>=3.0.0
-raganything[all]
+# Keep the multimodal PDF stack on the mutually compatible MinerU 3.x /
+# Transformers 4.x line. Transformers 5 removed APIs used by MinerU's MFR model.
+raganything[image,text,paddleocr,markdown]==1.4.1
+mineru[core]>=3.4.1,<4.0.0
+transformers>=4.57.3,<5.0.0

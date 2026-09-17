@@ -98,7 +98,7 @@ render_top_navigation("Multimodal", on_main_page=False)
 render_page_header(
     "多模态论文阅读",
     "按需启动 RAG-Anything，解析论文文本、图片、表格和公式；页面浏览不会再加载整套解析器。",
-    ["MinerU", "CUDA", "PaddleOCR-VL", "LightRAG"],
+    ["MinerU", "CUDA", "Vision LLM", "LightRAG"],
 )
 
 dependency_status = check_rag_anything_dependencies()
