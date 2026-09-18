@@ -24,11 +24,53 @@ from backend.evaluation import (
     score_answer_correctness,
     summarize_records,
 )
-from backend.rag_chain import PaperRAG, classify_refusal_answer, extract_source_citation_ids, is_refusal_answer
-from backend.prompts import build_qa_messages, is_yes_no_question
+from backend.rag_chain import (
+    PaperRAG,
+    _diversify_hits_by_paper,
+    analyze_question,
+    classify_refusal_answer,
+    extract_source_citation_ids,
+    is_refusal_answer,
+)
+from backend.prompts import build_qa_messages, is_multi_paper_question, is_yes_no_question
 
 
 class EvaluationMetricsTests(unittest.TestCase):
+    def test_research_background_searches_intro_abstract_and_related_work(self) -> None:
+        analysis = analyze_question("请总结多篇论文的研究背景")
+
+        self.assertEqual(analysis.intent, "background")
+        self.assertEqual(analysis.section_types, ["abstract", "introduction", "related_work"])
+
+    def test_multi_paper_prompt_groups_sources_by_file(self) -> None:
+        hits = [
+            {"text": "background A1", "metadata": {"file_name": "a.pdf"}},
+            {"text": "background A2", "metadata": {"file_name": "a.pdf"}},
+            {"text": "background B", "metadata": {"file_name": "b.pdf"}},
+        ]
+
+        prompt = build_qa_messages("总结这些论文的研究背景", hits)[1]["content"]
+
+        self.assertIn("2 篇论文", prompt)
+        self.assertIn("a.pdf、b.pdf", prompt)
+        self.assertIn("不能把 S1、S2 等来源编号当作不同论文", prompt)
+
+    def test_multi_paper_pronoun_question_is_detected(self) -> None:
+        self.assertTrue(is_multi_paper_question("他们分别采用什么方法？"))
+
+    def test_multi_paper_hits_are_balanced_across_documents(self) -> None:
+        hits = [
+            {"text": "a1", "metadata": {"paper_id": "a"}},
+            {"text": "a2", "metadata": {"paper_id": "a"}},
+            {"text": "a3", "metadata": {"paper_id": "a"}},
+            {"text": "b1", "metadata": {"paper_id": "b"}},
+            {"text": "c1", "metadata": {"paper_id": "c"}},
+        ]
+
+        balanced = _diversify_hits_by_paper(hits, 4)
+
+        self.assertEqual([hit["text"] for hit in balanced], ["a1", "b1", "c1", "a2"])
+
     def test_yes_no_prompt_is_only_added_to_binary_questions(self) -> None:
         hits = [{"text": "evidence", "metadata": {}}]
         self.assertTrue(is_yes_no_question("Does the method require labels?"))
@@ -245,7 +287,7 @@ class EvaluationMetricsTests(unittest.TestCase):
             def __init__(self, answer: str) -> None:
                 self.answer = answer
 
-            def chat(self, messages):
+            def chat(self, messages, temperature=0.2):
                 return self.answer
 
         hits = [{"text": "Direct evidence", "metadata": {"paper_id": "p"}}]
@@ -281,6 +323,28 @@ class EvaluationMetricsTests(unittest.TestCase):
         self.assertTrue(invalid["citation_repaired"])
         self.assertEqual(invalid_forced["refusal_reason"], "invalid_citation")
         self.assertTrue(is_refusal_answer("I could not find explicit evidence in the paper."))
+
+    def test_missing_citation_gets_one_corrective_retry(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def chat(self, messages, temperature=0.2):
+                self.calls += 1
+                if self.calls == 1:
+                    return "The method uses graph reinforcement learning."
+                return "The method uses graph reinforcement learning [S1]."
+
+        client = FakeClient()
+        result = PaperRAG(object(), client).answer_from_hits(  # type: ignore[arg-type]
+            "What method is used?",
+            [{"text": "The method uses graph reinforcement learning.", "metadata": {}}],
+        )
+
+        self.assertEqual(client.calls, 2)
+        self.assertTrue(result["citation_retry_attempted"])
+        self.assertIsNone(result["refusal_reason"])
+        self.assertEqual(result["answer"], "The method uses graph reinforcement learning [S1].")
 
     def test_suspicious_binary_comparison_gets_one_consistency_retry(self) -> None:
         class FakeClient:

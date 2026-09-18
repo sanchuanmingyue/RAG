@@ -59,6 +59,12 @@ class Settings:
         self.embedding_api_key = configured_embedding_key or (
             self.llm_api_key if self.embedding_base_url.rstrip("/") == self.llm_base_url.rstrip("/") else ""
         )
+        if (
+            not self.llm_api_key
+            and self.embedding_api_key
+            and self.embedding_base_url.rstrip("/") == self.llm_base_url.rstrip("/")
+        ):
+            self.llm_api_key = self.embedding_api_key
         self.embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small").strip()
         self.vision_base_url = (os.getenv("VISION_BASE_URL") or self.llm_base_url).strip()
         configured_vision_key = (os.getenv("VISION_API_KEY") or "").strip()
@@ -134,6 +140,12 @@ class Settings:
             os.getenv("CLAIM_CITATION_SIMILARITY_THRESHOLD", "0.55")
         )
         self.binary_consistency_retry = _env_bool("BINARY_CONSISTENCY_RETRY", True)
+        self.ieee_api_key = os.getenv("IEEE_API_KEY", "").strip()
+        self.ieee_api_base_url = os.getenv(
+            "IEEE_API_BASE_URL", "https://ieeexploreapi.ieee.org/api/v1"
+        ).strip().rstrip("/")
+        self.ieee_search_timeout_seconds = float(os.getenv("IEEE_SEARCH_TIMEOUT_SECONDS", "30"))
+        self.ieee_search_default_limit = int(os.getenv("IEEE_SEARCH_DEFAULT_LIMIT", "10"))
         self.api_max_upload_mb = int(os.getenv("API_MAX_UPLOAD_MB", "50"))
         self.api_background_workers = int(os.getenv("API_BACKGROUND_WORKERS", "2"))
         self.rag_anything_parser = os.getenv("RAG_ANYTHING_PARSER", "mineru").strip()
@@ -189,6 +201,10 @@ class Settings:
     @property
     def vision_is_ready(self) -> bool:
         return bool(self.vision_api_key and self.vision_base_url and self.rag_anything_vision_model)
+
+    @property
+    def ieee_is_ready(self) -> bool:
+        return bool(self.ieee_api_key and self.ieee_api_base_url)
 
 
 settings = Settings()

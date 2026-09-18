@@ -61,13 +61,15 @@ uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
 ## 功能
 
 - 上传一篇或多篇 PDF 论文
+- 顶部 Search 页面支持自然语言 IEEE Xplore 文献检索；Chat 中的“查找论文”请求可自动切换到外部检索
 - 使用 PyMuPDF 按页解析文本
 - 将文本切成 chunk，并保留 `paper_id`、`file_name`、`page`、`chunk_id`
 - 使用 OpenAI-compatible API 生成 embedding 和回答
 - 使用 Chroma 作为本地向量数据库
 - 问答时返回引用页码和检索片段
 - 生成论文阅读笔记：研究背景、研究问题、核心方法、创新点、实验设置、实验结果、优点、缺点、可改进方向
-- Agent Router 自动识别问答、总结、对比、来源解释和导出意图
+- Agent Router 自动识别问答、总结、对比、来源解释、导出、知识库状态、外部文献检索和全库分类意图
+- 全库分类复用已持久化的章节向量，按 Abstract、Introduction、Related Work 的研究背景语义聚类，无需逐篇重新生成 embedding
 - Memory 保存当前论文、选中的多篇论文、历史问题、最近来源和已生成阅读卡片
 - 多篇论文对比：先生成单篇阅读卡片，再基于卡片生成 Markdown 对比表
 - 支持将最近结果、来源片段、阅读卡片和会话记录导出为 Markdown 或 JSON
@@ -124,6 +126,7 @@ LLM_MODEL
 EMBEDDING_API_KEY
 EMBEDDING_BASE_URL
 EMBEDDING_MODEL
+IEEE_API_KEY
 ```
 
 生成模型支持按顺序自动切换的阿里云模型池。所有模型复用同一个 DashScope API Key 和
@@ -179,7 +182,8 @@ streamlit run app.py
 ```
 
 主界面采用“固定文件侧边栏 + 双栏阅读区”：左侧上传、选择论文和切换检索范围，主区域左栏进行
-流式论文问答、右栏按页预览 PDF 原文；顶部 `Chat / Files / Tools / Multimodal` 作为主导航，
+流式论文问答、右栏按页预览 PDF 原文；顶部 `Chat / Search / Files / Tools / Multimodal` 作为主导航，
+`Search` 将自然语言需求转换为英文检索式并查询 IEEE Xplore，结果保留 DOI、稳定链接与透明评分；
 `Files` 集中管理本地文件和索引状态，`Tools` 保留 Agent、阅读笔记、
 多论文对比及导出。PDF 预览采用逐页渲染，大文件不会在首屏一次性传入浏览器。
 
@@ -205,6 +209,7 @@ Windows 环境会自动让 MinerU 的 localhost 健康检查绕过系统代理�
 - `POST /api/v1/retrieve`：只执行检索，返回分阶段时延。
 - `POST /api/v1/chat`：执行检索增强问答。
 - `POST /api/v1/chat/stream`：以 SSE 流式返回 `meta`、`delta`、`done`/`error` 事件。
+- `POST /api/v1/literature/search`：使用自然语言检索 IEEE Xplore 文献元数据。
 - `POST /api/v1/summaries`：生成单篇论文阅读卡片。
 - `POST /api/v1/agent`：按 `session_id` 保存独立的 Agent 记忆。
 - `DELETE /api/v1/sessions/{session_id}`：清除对应会话记忆。
@@ -245,10 +250,11 @@ curl.exe -N -X POST "http://127.0.0.1:8000/api/v1/chat/stream" `
 2. 观察 PDF 解析、章节切分、向量生成和写库进度。
 3. 在中间问答区输入问题，答案会流式显示；在右侧用页码跳转对照 PDF 原文。
 4. 查看最终答案、引用章节、页码、拒答原因、模型和分阶段耗时。
-5. 进入 `Tools` 生成阅读笔记、多论文对比或导出结果。
-6. 在“Agent 工作台”中输入“总结这篇论文”“比较选中的论文”“解释刚才的来源”“导出 Markdown”等指令。
-7. 在左侧选择多篇论文后，进入“多论文对比与导出”生成对比表或导出结果。
-8. 打开检索调试页面，查看 Chroma 中的 chunk、元数据和排序结果。
+5. 进入 `Search` 描述主题和年份范围，或在 `Chat` 中直接输入“帮我查找……论文”。
+6. 进入 `Tools` 生成阅读笔记、多论文对比或导出结果。
+7. 在“Agent 工作台”中输入“总结这篇论文”“比较选中的论文”“解释刚才的来源”“导出 Markdown”等指令。
+8. 在左侧选择多篇论文后，进入“多论文对比与导出”生成对比表或导出结果。
+9. 打开检索调试页面，查看 Chroma 中的 chunk、元数据和排序结果。
 
 ## Agent 架构
 
@@ -257,7 +263,7 @@ curl.exe -N -X POST "http://127.0.0.1:8000/api/v1/chat/stream" `
 ```text
 用户输入
   -> backend/router.py 判断意图
-  -> backend/tools.py 调用问答、总结、对比、来源解释或导出工具
+  -> backend/tools.py 调用问答、总结、对比、来源解释、知识库状态、IEEE 检索、全库分类或导出工具
   -> backend/evaluator.py 检查 sources 和拒答条件
   -> backend/memory.py 更新当前论文、阅读卡片、最近来源和会话历史
   -> Streamlit 展示答案、来源和导出路径

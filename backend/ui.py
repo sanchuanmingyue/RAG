@@ -93,7 +93,7 @@ def apply_app_style() -> None:
 def render_top_navigation(active: str = "Chat", *, on_main_page: bool = True) -> str:
     """Render the shared app navigation and switch between Streamlit pages safely."""
 
-    main_destinations = {"Chat", "Files", "Tools"}
+    main_destinations = {"Chat", "Search", "Files", "Tools"}
     if active not in main_destinations | {"Multimodal"}:
         active = "Chat"
 
@@ -102,9 +102,9 @@ def render_top_navigation(active: str = "Chat", *, on_main_page: bool = True) ->
         with brand_col:
             st.markdown('<div class="rag-brand"><span>◉</span> PaperReader</div>', unsafe_allow_html=True)
         with navigation_col:
-            nav_columns = st.columns([1, 1, 1, 1.45, 3.3], gap="small")
-            destinations = ("Chat", "Files", "Tools", "Multimodal")
-            for column, label in zip(nav_columns[:4], destinations):
+            nav_columns = st.columns([1, 1, 1, 1, 1.45, 2.3], gap="small")
+            destinations = ("Chat", "Search", "Files", "Tools", "Multimodal")
+            for column, label in zip(nav_columns[:5], destinations):
                 if column.button(
                     label,
                     key=f"global_nav_{label.lower()}",

@@ -12,7 +12,16 @@ from typing import Any, Literal
 
 # AgentIntent 限定 Router 只能返回这些合法意图。
 # 这样编辑器和类型检查工具可以更早发现拼写错误，例如把 summary 写成 sumarize。
-AgentIntent = Literal["qa", "summary", "compare", "source_explain", "export"]
+AgentIntent = Literal[
+    "qa",
+    "summary",
+    "compare",
+    "source_explain",
+    "export",
+    "library_status",
+    "literature_search",
+    "corpus_analysis",
+]
 
 
 @dataclass

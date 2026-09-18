@@ -34,6 +34,11 @@ class AgentRequest(BaseModel):
     selected_paper_ids: list[str] = Field(default_factory=list, max_length=50)
 
 
+class LiteratureSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=5_000)
+    limit: int = Field(default=10, ge=1, le=50)
+
+
 class TaskResponse(BaseModel):
     task_id: str
     status: Literal["queued", "running", "succeeded", "failed"]

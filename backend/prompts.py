@@ -84,6 +84,18 @@ def answer_language(question: str) -> str:
     return "zh" if re.search(r"[\u4e00-\u9fff]", question) else "en"
 
 
+def is_multi_paper_question(question: str) -> bool:
+    """Detect questions that explicitly require evidence across papers."""
+
+    normalized = " ".join(question.lower().split())
+    return bool(
+        re.search(r"(?:多篇|各篇|每篇|这些|所有|全部).{0,8}(?:论文|文章|文献|研究)", normalized)
+        or re.search(r"(?:论文|文章|文献|研究).{0,8}(?:分别|共同|综合|整体|之间)", normalized)
+        or re.search(r"(?:他们|它们|这些|这几篇).{0,8}(?:分别|各自|共同|之间)", normalized)
+        or re.search(r"\b(?:papers|articles|studies|publications)\b", normalized)
+    )
+
+
 def build_qa_messages(question: str, chunks: list[dict[str, Any]]) -> list[dict[str, str]]:
     context = build_context(chunks)
     language_instruction = (
@@ -102,6 +114,29 @@ def build_qa_messages(question: str, chunks: list[dict[str, Any]]) -> list[dict[
             else "\nThis is a Yes/No question. Start the first sentence with 'Yes,' or 'No,' and verify "
             "that this polarity agrees with the explanation and any inequalities that follow."
         )
+    multi_paper_instruction = ""
+    if is_multi_paper_question(question):
+        paper_names = list(
+            dict.fromkeys(
+                str(chunk.get("metadata", {}).get("file_name") or "unknown")
+                for chunk in chunks
+            )
+        )
+        paper_list = "、".join(paper_names)
+        multi_paper_instruction = (
+            "\n这是多论文综合问题。请按论文分别归纳，再总结共同点或差异；每篇论文的结论应引用该论文自己的来源。"
+            f"本次证据来自 {len(paper_names)} 篇论文：{paper_list}。"
+            "同一 file 的多个来源编号属于同一篇论文；必须以 file 字段识别论文，不能把 S1、S2 等来源编号当作不同论文。"
+            "每个不同的 file 最多生成一个论文小节，小节标题优先使用文件名。"
+            "如果证据只覆盖部分论文，回答有依据的部分并明确哪些论文缺少证据，不要因此拒绝整个问题。"
+            if answer_language(question) == "zh"
+            else "\nThis is a multi-paper synthesis question. Summarize each paper separately before identifying "
+            f"shared themes or differences. The evidence covers {len(paper_names)} papers: {', '.join(paper_names)}. "
+            "Multiple source IDs with the same file field belong to one paper; never treat S1, S2, and other source "
+            "IDs as separate papers. Create at most one section per distinct file and cite evidence from that paper. "
+            "If evidence covers only "
+            "some papers, answer for those papers and identify the uncovered papers instead of refusing the whole question."
+        )
     user_prompt = f"""论文片段：
 {context}
 
@@ -114,7 +149,7 @@ def build_qa_messages(question: str, chunks: list[dict[str, Any]]) -> list[dict[
 或关键数字/名称被占位符替代时，不要猜测，必须拒答。
 本次唯一合法的来源编号范围是 [S1] 到 [S{len(chunks)}]，不要生成范围外的编号。
 除非问题明确要求详细分析，否则直接回答问题，不要复述检索过程或解释你如何作出判断。
-{language_instruction}{binary_instruction}"""
+{language_instruction}{binary_instruction}{multi_paper_instruction}"""
     return [
         {"role": "system", "content": QA_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},

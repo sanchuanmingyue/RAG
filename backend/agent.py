@@ -16,10 +16,20 @@ from __future__ import annotations
 from backend.embeddings import OpenAICompatibleClient
 from backend.evaluator import ResultEvaluator
 from backend.exporter import Exporter
+from backend.ieee_search import LiteratureSearchService
 from backend.memory import AgentMemory
 from backend.router import AgentRouter
 from backend.schemas import AgentResult
-from backend.tools import ExportTool, PaperCompareTool, PaperQATool, PaperSummaryTool, SourceExplainTool
+from backend.tools import (
+    ExportTool,
+    CorpusClassificationTool,
+    LibraryStatusTool,
+    LiteratureSearchTool,
+    PaperCompareTool,
+    PaperQATool,
+    PaperSummaryTool,
+    SourceExplainTool,
+)
 from backend.vector_store import ChromaVectorStore
 
 
@@ -52,6 +62,11 @@ class ResearchAgent:
         self.compare_tool = PaperCompareTool(llm_client)
         self.source_tool = SourceExplainTool()
         self.export_tool = ExportTool()
+        self.library_status_tool = LibraryStatusTool(vector_store)
+        self.literature_search_tool = LiteratureSearchTool(
+            LiteratureSearchService(llm_client=llm_client)
+        )
+        self.corpus_classification_tool = CorpusClassificationTool(vector_store, llm_client)
 
     def run(self, user_query: str) -> AgentResult:
         """执行一次 Agent 调度。
@@ -84,6 +99,12 @@ class ResearchAgent:
             file_format = Exporter.pick_format(user_query)
             result = self.export_tool.run(self.memory, file_format=file_format)
             self.memory.last_export_path = result.artifacts.get("path", "")
+        elif intent == "library_status":
+            result = self.library_status_tool.run(user_query)
+        elif intent == "literature_search":
+            result = self.literature_search_tool.run(user_query)
+        elif intent == "corpus_analysis":
+            result = self.corpus_classification_tool.run(user_query)
         else:
             # 默认意图是论文问答。paper_id 为 None 时表示在全部论文中检索。
             result = self.qa_tool.run(user_query, paper_id=self.memory.current_paper_id)

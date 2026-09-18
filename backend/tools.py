@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from backend.embeddings import OpenAICompatibleClient
+from backend.corpus_analysis import CorpusAnalysisService, format_corpus_classification
 from backend.exporter import Exporter
+from backend.ieee_search import LiteratureSearchService, format_search_answer
 from backend.paper_compare import compare_paper_cards
 from backend.rag_chain import PaperRAG, format_sources
 from backend.schemas import AgentResult
@@ -112,4 +114,88 @@ class ExportTool:
             answer=f"已导出到：{Path(path)}",
             intent="export",
             artifacts={"path": str(path), "format": file_format},
+        )
+
+
+class LibraryStatusTool:
+    """Read deterministic knowledge-base metadata without retrieval or an LLM call."""
+
+    def __init__(self, vector_store: ChromaVectorStore) -> None:
+        self.vector_store = vector_store
+
+    def run(self, question: str = "") -> AgentResult:
+        papers = self.vector_store.list_papers()
+        total_chunks = self.vector_store.count_chunks()
+        if not papers:
+            return AgentResult(
+                answer="当前知识库中没有已索引论文。",
+                intent="library_status",
+                artifacts={"paper_count": 0, "chunk_count": 0, "papers": []},
+            )
+
+        normalized = question.lower()
+        wants_details = any(
+            keyword in normalized
+            for keyword in ("列出", "列表", "哪些", "有什么", "每篇", "文件", "chunk", "状态", "是否")
+        )
+        answer = f"当前知识库共有 **{len(papers)} 篇**已索引论文，共 **{total_chunks} 个 chunks**。"
+        if wants_details:
+            rows = []
+            for index, paper in enumerate(papers, start=1):
+                rows.append(
+                    f"{index}. `{paper.get('file_name') or paper.get('paper_id') or '未命名论文'}`"
+                    f" — {int(paper.get('chunk_count') or 0)} chunks"
+                )
+            answer += "\n\n" + "\n".join(rows)
+        return AgentResult(
+            answer=answer,
+            intent="library_status",
+            artifacts={
+                "paper_count": len(papers),
+                "chunk_count": total_chunks,
+                "papers": papers,
+            },
+        )
+
+
+class LiteratureSearchTool:
+    """Expose verified IEEE Xplore discovery through the Agent tool interface."""
+
+    def __init__(self, search_service: LiteratureSearchService) -> None:
+        self.search_service = search_service
+
+    def run(self, request: str) -> AgentResult:
+        payload = self.search_service.search(request)
+        lines = [format_search_answer(payload)]
+        for item in payload.get("results") or []:
+            url = item.get("ieee_url") or (f"https://doi.org/{item['doi']}" if item.get("doi") else "")
+            title = item.get("title") or "未命名论文"
+            title_text = f"[{title}]({url})" if url else title
+            authors = ", ".join((item.get("authors") or [])[:4]) or "作者信息未返回"
+            score = (item.get("score") or {}).get("total", 0)
+            doi = item.get("doi") or "未返回"
+            lines.append(
+                f"{item.get('rank')}. **{title_text}**\n"
+                f"   - {authors} · {item.get('venue') or 'IEEE'} · {item.get('year') or '年份未知'}\n"
+                f"   - DOI：{doi} · 综合评分：{score}/12"
+            )
+        return AgentResult(
+            answer="\n\n".join(lines),
+            intent="literature_search",
+            artifacts={"search": payload},
+        )
+
+
+class CorpusClassificationTool:
+    """Classify the complete paper library by background-section semantics."""
+
+    def __init__(self, vector_store: ChromaVectorStore, llm_client: OpenAICompatibleClient) -> None:
+        self.service = CorpusAnalysisService(vector_store, llm_client)
+
+    def run(self, request: str) -> AgentResult:
+        payload = self.service.classify_by_background(request)
+        return AgentResult(
+            answer=format_corpus_classification(payload),
+            intent="corpus_analysis",
+            artifacts={"corpus_analysis": payload},
         )

@@ -9,7 +9,7 @@ from typing import Any
 
 from backend.config import settings
 from backend.embeddings import OpenAICompatibleClient
-from backend.prompts import answer_language, build_qa_messages, is_yes_no_question
+from backend.prompts import answer_language, build_qa_messages, is_multi_paper_question, is_yes_no_question
 from backend.vector_store import ChromaVectorStore
 
 
@@ -53,6 +53,20 @@ def analyze_question(question: str) -> QueryAnalysis:
     normalized = question.lower().strip()
 
     term_groups: list[tuple[str, tuple[str, ...], list[str], list[str]]] = [
+        (
+            "background",
+            (
+                "research background",
+                "problem background",
+                "motivation",
+                "研究背景",
+                "问题背景",
+                "研究动机",
+                "背景",
+            ),
+            ["abstract", "introduction", "related_work"],
+            ["research background", "problem context", "motivation", "research gap"],
+        ),
         (
             "experiment",
             (
@@ -113,13 +127,11 @@ def analyze_question(question: str) -> QueryAnalysis:
                 "prior work",
                 "previous work",
                 "literature",
-                "background",
                 "相关工作",
                 "相关研究",
                 "已有工作",
                 "现有工作",
                 "文献",
-                "背景",
             ),
             ["related_work"],
             ["related work", "prior work", "literature review", "background"],
@@ -240,6 +252,24 @@ def _needs_binary_consistency_retry(question: str, answer: str) -> bool:
     return negative_lead and comparison_explanation
 
 
+def _citation_retry_messages(
+    messages: list[dict[str, str]], raw_answer: str, source_count: int
+) -> list[dict[str, str]]:
+    """Ask once for the same supported answer with valid source citations."""
+
+    return messages + [
+        {"role": "assistant", "content": raw_answer},
+        {
+            "role": "user",
+            "content": (
+                f"上面的回答包含实质内容，但缺少可核验引用。请保留有论文证据支持的内容，"
+                f"并在每个关键结论后补充对应来源编号；唯一合法范围是 [S1] 到 [S{source_count}]。"
+                "不要新增原回答和来源中没有的事实，只输出修正后的完整回答。"
+            ),
+        },
+    ]
+
+
 def classify_refusal_answer(answer: str) -> str | None:
     """Classify a model response as a pure or mixed refusal.
 
@@ -277,6 +307,31 @@ def _strip_trailing_refusal(answer: str) -> str:
     while len(paragraphs) > 1 and classify_refusal_answer(paragraphs[-1]) == "pure_refusal":
         paragraphs.pop()
     return "\n\n".join(paragraphs).strip()
+
+
+def _diversify_hits_by_paper(hits: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
+    """Round-robin ranked hits so multi-paper synthesis receives cross-paper evidence."""
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for hit in hits:
+        metadata = hit.get("metadata", {})
+        paper_key = str(metadata.get("paper_id") or metadata.get("file_name") or "unknown")
+        grouped.setdefault(paper_key, []).append(hit)
+
+    selected: list[dict[str, Any]] = []
+    depth = 0
+    while len(selected) < top_k:
+        added = False
+        for paper_hits in grouped.values():
+            if depth < len(paper_hits):
+                selected.append(paper_hits[depth])
+                added = True
+                if len(selected) >= top_k:
+                    break
+        if not added:
+            break
+        depth += 1
+    return selected
 
 
 class PaperRAG:
@@ -319,24 +374,30 @@ class PaperRAG:
         retrieval_top_k = top_k if top_k is not None else (
             settings.retrieval_top_k if paper_id else settings.multi_paper_top_k
         )
+        multi_paper = paper_id is None and is_multi_paper_question(question)
+        query_top_k = retrieval_top_k * 2 if multi_paper else retrieval_top_k
         hits = self.vector_store.query(
             query_text=analysis.rewritten_query,
             embedding_client=self.llm_client,
-            top_k=retrieval_top_k,
+            top_k=query_top_k,
             paper_id=paper_id,
             section_types=analysis.section_types,
             retrieval_mode=retrieval_mode,
             expand_parent=expand_parent,
+            diversify_papers=multi_paper,
         )
         if analysis.section_types and not hits:
             hits = self.vector_store.query(
                 query_text=analysis.rewritten_query,
                 embedding_client=self.llm_client,
-                top_k=retrieval_top_k,
+                top_k=query_top_k,
                 paper_id=paper_id,
                 retrieval_mode=retrieval_mode,
                 expand_parent=expand_parent,
+                diversify_papers=multi_paper,
             )
+        if multi_paper:
+            hits = _diversify_hits_by_paper(hits, retrieval_top_k)
         return hits, analysis
 
     def answer_from_hits(
@@ -380,8 +441,23 @@ class PaperRAG:
                 ],
                 temperature=0.0,
             )
+        citation_retry_attempted = False
+        if settings.strict_citation and not _has_citation(raw_answer) and not is_refusal_answer(raw_answer):
+            citation_retry_attempted = True
+            raw_answer = qa_chat(
+                _citation_retry_messages(messages, raw_answer, len(hits)),
+                temperature=0.0,
+            )
         result = self._finalize_answer(raw_answer, hits, analysis)
         result["binary_consistency_retried"] = consistency_retried
+        result["citation_retry_attempted"] = citation_retry_attempted
+        if citation_retry_attempted:
+            retry_message = (
+                "初次回答缺少引用，已自动重新生成带引用答案。"
+                if result.get("refusal_reason") is None
+                else "自动补充引用后仍未生成合法引用，已触发保守拒答。"
+            )
+            result["warning"] = " ".join(filter(None, (result.get("warning"), retry_message)))
         result["model_metadata"] = dict(getattr(self.llm_client, "last_chat_metadata", {}) or {})
         return result
 
@@ -475,7 +551,23 @@ class PaperRAG:
             yield {"event": "delta", "data": {"text": delta}}
 
         raw_answer = "".join(parts)
+        citation_retry_attempted = False
+        if settings.strict_citation and not _has_citation(raw_answer) and not is_refusal_answer(raw_answer):
+            citation_retry_attempted = True
+            qa_chat = getattr(self.llm_client, "chat_qa", self.llm_client.chat)
+            raw_answer = qa_chat(
+                _citation_retry_messages(build_qa_messages(question, hits), raw_answer, len(hits)),
+                temperature=0.0,
+            )
         result = self._finalize_answer(raw_answer, hits, analysis)
+        result["citation_retry_attempted"] = citation_retry_attempted
+        if citation_retry_attempted:
+            retry_message = (
+                "初次回答缺少引用，已自动重新生成带引用答案。"
+                if result.get("refusal_reason") is None
+                else "自动补充引用后仍未生成合法引用，已触发保守拒答。"
+            )
+            result["warning"] = " ".join(filter(None, (result.get("warning"), retry_message)))
         result["model_metadata"] = dict(getattr(self.llm_client, "last_chat_metadata", {}) or {})
         yield {"event": "done", "data": result}
 

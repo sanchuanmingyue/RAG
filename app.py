@@ -18,10 +18,14 @@ import streamlit as st
 from backend.config import PAPER_DIR, settings
 from backend.embeddings import OpenAICompatibleClient
 from backend.exporter import Exporter
+from backend.ieee_search import (
+    LiteratureSearchService,
+    format_search_answer,
+)
 from backend.memory import AgentMemory
 from backend.router import AgentRouter
 from backend.services import PaperService
-from backend.tools import SourceExplainTool
+from backend.tools import LibraryStatusTool, SourceExplainTool
 from backend.ui import apply_app_style, render_top_navigation
 from backend.vector_store import ChromaVectorStore
 
@@ -64,6 +68,14 @@ def get_paper_service() -> PaperService:
     if settings.enable_startup_warmup:
         service.warmup()
     return service
+
+
+@st.cache_resource
+def get_literature_search_service() -> LiteratureSearchService:
+    """Create the IEEE search boundary once per Streamlit process."""
+
+    llm_client = get_llm_client() if settings.is_ready else None
+    return LiteratureSearchService(llm_client=llm_client)
 
 
 def save_uploaded_pdf(uploaded_file) -> Path:
@@ -187,6 +199,7 @@ def compact_result_for_history(result: dict) -> dict:
         "refusal_type",
         "warning",
         "citation_repaired",
+        "citation_retry_attempted",
         "model_metadata",
         "timings_ms",
         "top_k",
@@ -228,6 +241,67 @@ def ensure_api_ready() -> bool:
     return False
 
 
+def ensure_ieee_ready() -> bool:
+    if settings.ieee_is_ready:
+        return True
+    st.warning("请先在 .env 中配置 IEEE_API_KEY，然后重启应用。")
+    return False
+
+
+def render_literature_results(payload: dict, *, key_prefix: str) -> None:
+    """Render verified IEEE metadata and the transparent ranking breakdown."""
+
+    results = payload.get("results") or []
+    plan = payload.get("query_plan") or {}
+    years = [str(value) for value in (plan.get("start_year"), plan.get("end_year")) if value]
+    year_label = "–".join(years) if years else "不限年份"
+    st.caption(
+        f"IEEE Xplore · 检索式：{plan.get('querytext') or '-'} · {year_label} · "
+        f"命中 {payload.get('total_records', 0)} 条，展示 {len(results)} 条"
+    )
+    if not results:
+        st.info("没有找到满足当前主题和年份条件、且带 DOI 或稳定 IEEE 链接的结果。")
+        return
+
+    for item in results:
+        with st.container(border=True, key=f"{key_prefix}_paper_{item.get('rank')}_{item.get('article_number') or item.get('doi') or item.get('api_position')}"):
+            st.markdown(f"**{item.get('rank')}. {item.get('title')}**")
+            authors = item.get("authors") or []
+            author_text = ", ".join(authors[:6]) or "作者信息未返回"
+            if len(authors) > 6:
+                author_text += " 等"
+            st.caption(
+                f"{author_text} · {item.get('venue') or 'IEEE'} · {item.get('year') or '年份未知'}"
+            )
+            score = item.get("score") or {}
+            st.caption(
+                f"综合 {score.get('total', 0)}/12 · 相关性 {score.get('relevance', 0)}/5 · "
+                f"来源匹配 {score.get('venue_fit', 0)}/3 · 时效性 {score.get('recency', 0)}/2 · "
+                f"元数据 {score.get('metadata', 0)}/2"
+            )
+            if item.get("abstract_snippet"):
+                st.write(item["abstract_snippet"])
+            link_columns = st.columns([1, 1, 3])
+            if item.get("ieee_url"):
+                link_columns[0].link_button("IEEE Xplore", item["ieee_url"], width="stretch")
+            if item.get("doi"):
+                link_columns[1].link_button(
+                    "DOI", f"https://doi.org/{item['doi']}", width="stretch"
+                )
+
+    with st.expander("查看检索记录", expanded=False):
+        search_log = payload.get("search_log") or {}
+        st.json(
+            {
+                "自然语言需求": payload.get("request"),
+                "实际检索式": search_log.get("querytext"),
+                "来源": search_log.get("source_order"),
+                "检索时间": search_log.get("searched_at"),
+                "去重规则": search_log.get("deduplication"),
+            }
+        )
+
+
 def run_agent_query(user_query: str) -> None:
     """执行 Agent 工作台的一条指令，并把结果写入 Memory。
 
@@ -252,6 +326,16 @@ def run_agent_query(user_query: str) -> None:
         result = SourceExplainTool().run(agent_memory.last_sources)
         agent_memory.remember_result(result.answer, result.sources)
         agent_memory.add_turn("assistant", result.answer)
+        return
+
+    if intent == "library_status":
+        agent_memory.add_turn("user", user_query)
+        result = LibraryStatusTool(get_vector_store()).run(user_query)
+        agent_memory.remember_result(result.answer, [])
+        agent_memory.add_turn("assistant", result.answer)
+        return
+
+    if intent == "literature_search" and not ensure_ieee_ready():
         return
 
     if not ensure_api_ready():
@@ -327,8 +411,13 @@ def render_chat_turn(message: dict, index: int) -> None:
         with st.container(border=True, key=f"chat_assistant_{index}"):
             st.markdown(message["content"])
             if message.get("result"):
-                render_answer_details(message["result"], paper_id=message.get("paper_id"))
-                render_sources(message["result"].get("sources", []), key_prefix=f"history_{index}")
+                if message["result"].get("kind") == "literature_search":
+                    render_literature_results(
+                        message["result"]["payload"], key_prefix=f"history_search_{index}"
+                    )
+                else:
+                    render_answer_details(message["result"], paper_id=message.get("paper_id"))
+                    render_sources(message["result"].get("sources", []), key_prefix=f"history_{index}")
 
 
 def render_chat_panel(paper_id: str | None, has_papers: bool) -> None:
@@ -345,12 +434,13 @@ def render_chat_panel(paper_id: str | None, has_papers: bool) -> None:
 
     with st.container(height=610, border=True, key="chat_history"):
         if not st.session_state.messages:
-            st.info("选择左侧论文后开始提问。回答会附带章节、页码和引用编号。")
+            st.info("可对已上传论文提问，也可直接说“帮我查找近三年关于 RAG 的 IEEE 论文”。")
         for index, message in enumerate(st.session_state.messages):
             render_chat_turn(message, index)
 
         pending_question = st.session_state.get("pending_question")
         if pending_question:
+            pending_intent = AgentRouter().route(pending_question)
             live_answer, _ = st.columns([4, 1.15])
             with live_answer:
                 st.markdown(
@@ -359,37 +449,87 @@ def render_chat_panel(paper_id: str | None, has_papers: bool) -> None:
                 )
                 with st.container(border=True, key="chat_assistant_live"):
                     answer_placeholder = st.empty()
-                    streamed_answer = ""
-                    result = None
-                    try:
-                        for event in get_paper_service().answer_stream(pending_question, paper_id=paper_id):
-                            if event["event"] == "delta":
-                                streamed_answer += event["data"].get("text", "")
-                                answer_placeholder.markdown(streamed_answer + "▌")
-                            elif event["event"] == "done":
-                                result = event["data"]
-                            elif event["event"] == "error":
-                                raise RuntimeError(event["data"].get("error", "流式回答失败"))
-                    except Exception as exc:
-                        st.session_state.pop("pending_question", None)
-                        st.error(f"问答失败：{exc}")
-                    else:
-                        st.session_state.pop("pending_question", None)
-                        if result is None:
-                            st.error("问答失败：生成服务没有返回最终结果。")
+                    if pending_intent == "literature_search":
+                        try:
+                            with st.spinner("正在理解检索需求并查询 IEEE Xplore..."):
+                                search_payload = get_literature_search_service().search(pending_question)
+                            answer = format_search_answer(search_payload)
+                        except Exception as exc:
+                            st.session_state.pop("pending_question", None)
+                            st.error(f"文献检索失败：{exc}")
                         else:
-                            answer_placeholder.markdown(result["answer"])
-                            render_answer_details(result, paper_id=paper_id)
-                            render_sources(result.get("sources", []), key_prefix="live")
+                            st.session_state.pop("pending_question", None)
+                            answer_placeholder.markdown(answer)
+                            render_literature_results(search_payload, key_prefix="live_search")
                             st.session_state.messages.append(
                                 {
                                     "role": "assistant",
-                                    "content": result["answer"],
-                                    "result": compact_result_for_history(result),
-                                    "paper_id": paper_id,
+                                    "content": answer,
+                                    "result": {"kind": "literature_search", "payload": search_payload},
                                 }
                             )
                             st.rerun()
+                    elif pending_intent == "library_status":
+                        try:
+                            status_result = LibraryStatusTool(get_vector_store()).run(pending_question)
+                        except Exception as exc:
+                            st.session_state.pop("pending_question", None)
+                            st.error(f"知识库状态查询失败：{exc}")
+                        else:
+                            st.session_state.pop("pending_question", None)
+                            answer_placeholder.markdown(status_result.answer)
+                            st.session_state.messages.append(
+                                {"role": "assistant", "content": status_result.answer}
+                            )
+                            st.rerun()
+                    elif pending_intent == "corpus_analysis":
+                        try:
+                            with st.spinner("正在读取全库背景章节、执行语义聚类并生成类别名称..."):
+                                corpus_result = get_paper_service().run_agent(
+                                    pending_question, agent_memory
+                                )
+                        except Exception as exc:
+                            st.session_state.pop("pending_question", None)
+                            st.error(f"全库分类失败：{exc}")
+                        else:
+                            st.session_state.pop("pending_question", None)
+                            answer_placeholder.markdown(corpus_result["answer"])
+                            st.session_state.messages.append(
+                                {"role": "assistant", "content": corpus_result["answer"]}
+                            )
+                            st.rerun()
+                    else:
+                        streamed_answer = ""
+                        result = None
+                        try:
+                            for event in get_paper_service().answer_stream(pending_question, paper_id=paper_id):
+                                if event["event"] == "delta":
+                                    streamed_answer += event["data"].get("text", "")
+                                    answer_placeholder.markdown(streamed_answer + "▌")
+                                elif event["event"] == "done":
+                                    result = event["data"]
+                                elif event["event"] == "error":
+                                    raise RuntimeError(event["data"].get("error", "流式回答失败"))
+                        except Exception as exc:
+                            st.session_state.pop("pending_question", None)
+                            st.error(f"问答失败：{exc}")
+                        else:
+                            st.session_state.pop("pending_question", None)
+                            if result is None:
+                                st.error("问答失败：生成服务没有返回最终结果。")
+                            else:
+                                answer_placeholder.markdown(result["answer"])
+                                render_answer_details(result, paper_id=paper_id)
+                                render_sources(result.get("sources", []), key_prefix="live")
+                                st.session_state.messages.append(
+                                    {
+                                        "role": "assistant",
+                                        "content": result["answer"],
+                                        "result": compact_result_for_history(result),
+                                        "paper_id": paper_id,
+                                    }
+                                )
+                                st.rerun()
 
     quick1, quick2, quick3 = st.columns(3)
     if quick1.button("核心方法", width="stretch", key="chat_method"):
@@ -402,19 +542,25 @@ def render_chat_panel(paper_id: str | None, has_papers: bool) -> None:
     question = st.text_area(
         "输入问题",
         key="workspace_question",
-        placeholder="针对当前论文提问…",
+        placeholder="针对当前论文提问，或直接描述想查找的 IEEE 文献…",
         height=76,
         label_visibility="collapsed",
     )
     if st.button(
         "发送",
         type="primary",
-        disabled=not question.strip() or not has_papers,
+        disabled=not question.strip(),
         width="stretch",
         key="workspace_send",
     ):
-        if ensure_api_ready():
-            clean_question = question.strip()
+        clean_question = question.strip()
+        intent = AgentRouter().route(clean_question)
+        if intent == "literature_search" and not ensure_ieee_ready():
+            return
+        if intent not in {"literature_search", "library_status"} and not has_papers:
+            st.warning("当前没有已索引论文；如需外部检索，请明确说“查找/搜索 IEEE 论文”。")
+            return
+        if intent in {"literature_search", "library_status"} or ensure_api_ready():
             st.session_state.messages.append({"role": "user", "content": clean_question})
             st.session_state.pending_question = clean_question
             st.session_state.clear_workspace_question = True
@@ -546,6 +692,40 @@ if navigation == "Chat":
                 st.warning("索引存在，但本地 PDF 文件未找到。")
             else:
                 st.info("选择或上传论文后，可在这里对照查看原文。")
+
+elif navigation == "Search":
+    st.markdown(
+        '<div class="rag-view-heading"><h2>智能文献检索</h2>'
+        '<p>用自然语言描述研究主题、时间范围或方法，系统将查询 IEEE Xplore 并给出可核验结果</p></div>',
+        unsafe_allow_html=True,
+    )
+    with st.container(border=True):
+        with st.form("literature_search_form"):
+            search_request = st.text_area(
+                "检索需求",
+                placeholder="例如：查找 2022 年以来关于多模态 RAG 用于科研论文理解的 IEEE 文献",
+                height=110,
+            )
+            result_limit = st.slider("返回数量", min_value=5, max_value=25, value=10, step=5)
+            submitted = st.form_submit_button("搜索 IEEE Xplore", type="primary", width="stretch")
+        if submitted:
+            if not search_request.strip():
+                st.warning("请输入文献检索需求。")
+            elif ensure_ieee_ready():
+                try:
+                    with st.spinner("正在生成检索式并查询 IEEE Xplore..."):
+                        st.session_state.literature_search_result = get_literature_search_service().search(
+                            search_request, limit=result_limit
+                        )
+                except Exception as exc:
+                    st.error(f"文献检索失败：{exc}")
+
+    if st.session_state.get("literature_search_result"):
+        payload = st.session_state.literature_search_result
+        st.markdown(format_search_answer(payload))
+        render_literature_results(payload, key_prefix="search_page")
+    elif not settings.ieee_is_ready:
+        st.info("Search 页面已接入完成。请在 .env 中填写 IEEE_API_KEY 后重启应用。")
 
 elif navigation == "Files":
     st.subheader("文件管理")

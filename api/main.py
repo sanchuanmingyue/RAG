@@ -18,8 +18,17 @@ from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Request, U
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import StreamingResponse
 
-from api.schemas import AgentRequest, ChatRequest, MessageResponse, RetrieveRequest, SummaryRequest, TaskResponse
+from api.schemas import (
+    AgentRequest,
+    ChatRequest,
+    LiteratureSearchRequest,
+    MessageResponse,
+    RetrieveRequest,
+    SummaryRequest,
+    TaskResponse,
+)
 from backend.config import PAPER_DIR, settings
+from backend.ieee_search import LiteratureSearchService
 from backend.services import AgentSessionStore, BackgroundTaskManager, PaperService
 
 
@@ -28,6 +37,9 @@ class APIContainer:
 
     def __init__(self) -> None:
         self.paper_service = PaperService()
+        self.literature_search_service = LiteratureSearchService(
+            llm_client=self.paper_service.llm_client if settings.is_ready else None
+        )
         self.sessions = AgentSessionStore()
         self.tasks = BackgroundTaskManager(max_workers=settings.api_background_workers)
 
@@ -44,6 +56,14 @@ def _require_model_configuration() -> None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="生成模型或向量模型 API 尚未完整配置，请检查 .env。",
+        )
+
+
+def _require_ieee_configuration() -> None:
+    if not settings.ieee_is_ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="IEEE_API_KEY 尚未配置，请检查 .env。",
         )
 
 
@@ -112,6 +132,7 @@ async def health(container: APIContainer = Depends(_get_container)) -> dict:
         "llm_models": settings.llm_models,
         "embedding_configured": settings.embedding_is_ready,
         "embedding_model": settings.embedding_model,
+        "ieee_search_configured": settings.ieee_is_ready,
         "single_paper_top_k": settings.retrieval_top_k,
         "multi_paper_top_k": settings.multi_paper_top_k,
         "collection": container.paper_service.vector_store.collection_name,
@@ -204,6 +225,24 @@ async def chat(payload: ChatRequest, container: APIContainer = Depends(_get_cont
             top_k=payload.top_k,
             retrieval_mode=payload.retrieval_mode,
             expand_parent=payload.expand_parent,
+        )
+    except Exception as exc:
+        raise _translate_operation_error(exc) from exc
+
+
+@router.post("/literature/search")
+async def literature_search(
+    payload: LiteratureSearchRequest,
+    container: APIContainer = Depends(_get_container),
+) -> dict:
+    """Search verifiable IEEE Xplore metadata from a natural-language request."""
+
+    _require_ieee_configuration()
+    try:
+        return await run_in_threadpool(
+            container.literature_search_service.search,
+            payload.query,
+            limit=payload.limit,
         )
     except Exception as exc:
         raise _translate_operation_error(exc) from exc

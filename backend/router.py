@@ -7,7 +7,65 @@ Router 对应方案里的“任务路由”。它把用户自然语言指令映�
 
 from __future__ import annotations
 
+import re
+
+from backend.ieee_search import is_literature_search_query
 from backend.schemas import AgentIntent
+
+
+_LIBRARY_SCOPE_KEYWORDS = (
+    "知识库",
+    "向量库",
+    "当前库",
+    "库中",
+    "库里",
+    "已索引",
+    "索引状态",
+    "collection",
+)
+_LIBRARY_ACTION_KEYWORDS = (
+    "多少",
+    "几篇",
+    "数量",
+    "统计",
+    "列出",
+    "列表",
+    "哪些",
+    "有什么",
+    "是否",
+    "状态",
+    "chunk",
+    "文件",
+)
+
+
+def is_library_status_query(text: str) -> bool:
+    """Detect metadata/status questions that should not enter semantic RAG."""
+
+    normalized = " ".join(text.lower().strip().split())
+    has_scope = any(keyword in normalized for keyword in _LIBRARY_SCOPE_KEYWORDS)
+    has_action = any(keyword in normalized for keyword in _LIBRARY_ACTION_KEYWORDS)
+    uploaded_count = (
+        any(keyword in normalized for keyword in ("上传了", "导入了", "收录了"))
+        and any(keyword in normalized for keyword in ("多少篇", "几篇", "哪些论文", "论文列表"))
+    )
+    return (has_scope and has_action) or uploaded_count
+
+
+def is_corpus_analysis_query(text: str) -> bool:
+    """Detect requests that require analyzing every paper rather than Top-K retrieval."""
+
+    normalized = " ".join(text.lower().strip().split())
+    has_action = any(
+        keyword in normalized
+        for keyword in ("分类", "归类", "聚类", "分组", "分成", "分为", "划分")
+    )
+    has_subject = any(keyword in normalized for keyword in ("论文", "文章", "文献"))
+    has_batch_scope = any(
+        keyword in normalized
+        for keyword in ("全部", "所有", "全库", "当前库", "知识库", "库中", "库里", "这些", "这批", "多篇")
+    ) or bool(re.search(r"\d+\s*篇", normalized))
+    return has_action and has_subject and has_batch_scope
 
 
 class AgentRouter:
@@ -32,6 +90,12 @@ class AgentRouter:
 
         if self._has_any(normalized, self.EXPORT_KEYWORDS):
             return "export"
+        if is_corpus_analysis_query(normalized):
+            return "corpus_analysis"
+        if is_literature_search_query(normalized):
+            return "literature_search"
+        if is_library_status_query(normalized):
+            return "library_status"
         if self._has_any(normalized, self.COMPARE_KEYWORDS):
             return "compare"
         if self._has_any(normalized, self.SOURCE_KEYWORDS):

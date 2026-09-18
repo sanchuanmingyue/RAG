@@ -51,9 +51,20 @@ class _FakePaperService:
         yield {"event": "done", "data": {"answer": "答案 [S1]", "sources": []}}
 
 
+class _FakeLiteratureSearchService:
+    def search(self, query, *, limit=10):
+        return {
+            "request": query,
+            "returned": 1,
+            "results": [{"title": "Verified IEEE Paper", "rank": 1}],
+            "query_plan": {"querytext": "verified query"},
+        }
+
+
 class _FakeContainer:
     def __init__(self) -> None:
         self.paper_service = _FakePaperService()
+        self.literature_search_service = _FakeLiteratureSearchService()
         self.sessions = AgentSessionStore()
         self.tasks = BackgroundTaskManager(max_workers=1)
 
@@ -142,6 +153,22 @@ class FastAPIRefactorTests(unittest.TestCase):
         self.assertEqual(configured.rag_anything_vision_model, "Qwen/Qwen3.5-4B")
         self.assertTrue(configured.vision_is_ready)
         self.assertEqual(configured.rag_anything_embedding_dim, 1024)
+
+    def test_llm_reuses_embedding_key_for_the_same_provider(self) -> None:
+        environment = {
+            "LLM_API_KEY": "",
+            "LLM_BASE_URL": "https://api.siliconflow.cn/v1",
+            "LLM_MODELS": "THUDM/GLM-4-9B-0414,Qwen/Qwen3.5-4B",
+            "EMBEDDING_API_KEY": "shared-siliconflow-key",
+            "EMBEDDING_BASE_URL": "https://api.siliconflow.cn/v1",
+            "EMBEDDING_MODEL": "BAAI/bge-m3",
+        }
+
+        with patch.dict("os.environ", environment, clear=False):
+            configured = Settings()
+
+        self.assertTrue(configured.is_ready)
+        self.assertEqual(configured.llm_api_key, "shared-siliconflow-key")
 
     def test_ordered_llm_model_pool_configuration(self) -> None:
         environment = {
@@ -394,3 +421,15 @@ class FastAPIRefactorTests(unittest.TestCase):
         self.assertTrue(response.headers["content-type"].startswith("text/event-stream"))
         self.assertLess(response.text.index("event: meta"), response.text.index("event: delta"))
         self.assertLess(response.text.index("event: delta"), response.text.index("event: done"))
+
+    def test_literature_search_endpoint_accepts_natural_language(self) -> None:
+        app = create_app(_FakeContainer)
+        with patch.object(settings, "ieee_api_key", "test-key"):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/v1/literature/search",
+                    json={"query": "查找多模态 RAG 论文", "limit": 5},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["results"][0]["title"], "Verified IEEE Paper")

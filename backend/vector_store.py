@@ -194,6 +194,7 @@ class ChromaVectorStore:
         *,
         retrieval_mode: str | None = None,
         expand_parent: bool | None = None,
+        diversify_papers: bool = False,
     ) -> list[dict[str, Any]]:
         """Retrieve documents first, then rank aggregated sections within them."""
 
@@ -268,6 +269,8 @@ class ChromaVectorStore:
         if settings.enable_section_reranker and hasattr(self, "section_reranker"):
             hits = self.section_reranker.rerank(query_text, hits)
         section_reranker_ms = (perf_counter() - section_reranker_started) * 1000
+        if diversify_papers:
+            hits = self._diversify_papers(hits, top_k)
         hits = hits[:top_k]
         parent_started = perf_counter()
         if settings.enable_parent_context if expand_parent is None else expand_parent:
@@ -536,6 +539,77 @@ class ChromaVectorStore:
         )
         return self._normalize_get_result(result)
 
+    def get_corpus_background_profiles(self, max_text_chars: int = 3200) -> list[dict[str, Any]]:
+        """Build one background-focused text/vector profile per indexed paper.
+
+        Existing section centroids are reused, so corpus classification does not
+        generate 83 new embeddings or make one LLM request per paper.
+        """
+
+        result = self.section_collection.get(
+            include=["documents", "metadatas", "embeddings"]
+        )
+        embeddings = result.get("embeddings")
+        if embeddings is None:
+            embeddings = []
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for document, metadata, embedding in zip(
+            result.get("documents") or [],
+            result.get("metadatas") or [],
+            embeddings,
+        ):
+            metadata = dict(metadata or {})
+            paper_id = str(metadata.get("paper_id") or "")
+            if not paper_id or embedding is None:
+                continue
+            grouped.setdefault(paper_id, []).append(
+                {
+                    "text": str(document or ""),
+                    "metadata": metadata,
+                    "embedding": [float(value) for value in embedding],
+                }
+            )
+
+        preferred_types = {"abstract", "introduction", "related_work"}
+        profiles: list[dict[str, Any]] = []
+        for paper_id, rows in grouped.items():
+            selected = [
+                row for row in rows
+                if str(row["metadata"].get("section_type") or "") in preferred_types
+            ]
+            if not selected:
+                selected = [
+                    row for row in rows
+                    if str(row["metadata"].get("section_type") or "") != "references"
+                ][:2]
+            if not selected:
+                continue
+            dimension = len(selected[0]["embedding"])
+            compatible = [row for row in selected if len(row["embedding"]) == dimension]
+            if not compatible:
+                continue
+            centroid = [
+                sum(row["embedding"][index] for row in compatible) / len(compatible)
+                for index in range(dimension)
+            ]
+            metadata = compatible[0]["metadata"]
+            text = "\n\n".join(row["text"] for row in compatible)
+            profiles.append(
+                {
+                    "paper_id": paper_id,
+                    "file_name": str(metadata.get("file_name") or paper_id),
+                    "text": text[: max(max_text_chars, 500)],
+                    "embedding": centroid,
+                    "section_types": sorted(
+                        {
+                            str(row["metadata"].get("section_type") or "unknown")
+                            for row in compatible
+                        }
+                    ),
+                }
+            )
+        return sorted(profiles, key=lambda item: item["file_name"].lower())
+
     def delete_paper(self, paper_id: str) -> None:
         self.collection.delete(where={"paper_id": paper_id})
         self.section_collection.delete(where={"paper_id": paper_id})
@@ -803,6 +877,33 @@ class ChromaVectorStore:
             scores.append((paper_id, 0.65 * best + 0.25 * mean_score + 0.1 / first_rank))
         scores.sort(key=lambda value: value[1], reverse=True)
         return [paper_id for paper_id, _score in scores[: max(top_k, 1)]]
+
+    @staticmethod
+    def _diversify_papers(hits: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
+        """Front-load one ranked section per paper before filling deeper ranks."""
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for hit in hits:
+            metadata = hit.get("metadata", {})
+            paper_key = str(metadata.get("paper_id") or metadata.get("file_name") or "unknown")
+            grouped.setdefault(paper_key, []).append(hit)
+
+        selected: list[dict[str, Any]] = []
+        depth = 0
+        while len(selected) < top_k:
+            added = False
+            for paper_hits in grouped.values():
+                if depth < len(paper_hits):
+                    selected.append(paper_hits[depth])
+                    added = True
+                    if len(selected) >= top_k:
+                        break
+            if not added:
+                break
+            depth += 1
+
+        selected_ids = {id(hit) for hit in selected}
+        return selected + [hit for hit in hits if id(hit) not in selected_ids]
 
     @staticmethod
     def _section_key(hit: dict[str, Any]) -> str:
