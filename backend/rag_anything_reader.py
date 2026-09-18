@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from functools import lru_cache, partial
 import importlib.util
 from importlib.metadata import PackageNotFoundError, version
+import logging
 from pathlib import Path
 import os
 import subprocess
@@ -14,6 +15,9 @@ import urllib.request
 from typing import Any
 
 from backend.config import RAG_ANYTHING_DIR, RAG_ANYTHING_OUTPUT_DIR, settings
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -203,6 +207,46 @@ def _mineru_major_version() -> int:
         return 0
 
 
+async def _complete_with_model_pool(
+    completion_func,
+    prompt: str,
+    *,
+    system_prompt: str | None = None,
+    history_messages: list[dict[str, Any]] | None = None,
+    **kwargs,
+) -> str:
+    """Run a LightRAG completion against the configured ordered model pool."""
+
+    attempted: list[str] = []
+    last_error: Exception | None = None
+    for model in settings.llm_models:
+        attempted.append(model)
+        try:
+            result = await completion_func(
+                model,
+                prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages or [],
+                api_key=settings.llm_api_key,
+                base_url=settings.llm_base_url,
+                **kwargs,
+            )
+            if not isinstance(result, str) or not result.strip():
+                raise RuntimeError(f"模型 {model} 返回了空响应")
+            if len(attempted) > 1:
+                logger.info("RAG-Anything switched to fallback model %s", model)
+            return result
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "RAG-Anything model %s failed; trying the next configured model",
+                model,
+            )
+
+    configured = ", ".join(attempted) or "未配置模型"
+    raise RuntimeError(f"多模态问答模型均不可用，已尝试：{configured}") from last_error
+
+
 class RagAnythingPaperReader:
     """Build and run a RAG-Anything pipeline with this project's model config."""
 
@@ -242,14 +286,12 @@ class RagAnythingPaperReader:
             enable_equation_processing=settings.rag_anything_formula,
         )
 
-        def llm_model_func(prompt, system_prompt=None, history_messages=None, **kwargs):
-            return openai_complete_if_cache(
-                settings.llm_model,
+        async def llm_model_func(prompt, system_prompt=None, history_messages=None, **kwargs):
+            return await _complete_with_model_pool(
+                openai_complete_if_cache,
                 prompt,
                 system_prompt=system_prompt,
                 history_messages=history_messages or [],
-                api_key=settings.llm_api_key,
-                base_url=settings.llm_base_url,
                 **kwargs,
             )
 
@@ -370,7 +412,15 @@ class RagAnythingPaperReader:
         return await self.rag.process_document_complete(**kwargs)
 
     async def ask(self, question: str, *, mode: str = "hybrid") -> Any:
-        return await self.rag.aquery(question, mode=mode)
+        init_result = await self.rag._ensure_lightrag_initialized()
+        if not init_result or not init_result.get("success"):
+            error = (init_result or {}).get("error", "unknown error")
+            raise RuntimeError(f"LightRAG 初始化失败：{error}")
+
+        result = await self.rag.aquery(question, mode=mode)
+        if result is None:
+            raise RuntimeError("模型没有返回回答，请检查模型额度或切换可用模型。")
+        return result
 
     async def ask_with_content(
         self,

@@ -129,6 +129,9 @@ status_col2.metric("CUDA", "可用" if runtime.cuda_available else "不可用")
 status_col3.metric("GPU", runtime.gpu_name or "CPU")
 status_col4.metric("多模态索引", "就绪" if index_ready else "尚未建立")
 
+if index_ready:
+    st.caption("多模态索引已保存到本地；关闭或重启应用后会自动恢复，无需重新解析。")
+
 if runtime.cuda_available and runtime.vram_gb is not None and runtime.vram_gb <= 4.5:
     st.info(
         f"已识别 {runtime.gpu_name}（约 {runtime.vram_gb} GB 显存）。建议首次只解析 5～10 页；"

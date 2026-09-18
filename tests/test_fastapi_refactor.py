@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import unittest
@@ -10,10 +11,14 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from api.main import create_app
-from backend.config import Settings
+from backend.config import Settings, settings
 from backend.embeddings import OpenAICompatibleClient
 from backend.services import AgentSessionStore, BackgroundTaskManager, PaperService
-from backend.rag_anything_reader import _ensure_loopback_proxy_bypass
+from backend.rag_anything_reader import (
+    RagAnythingPaperReader,
+    _complete_with_model_pool,
+    _ensure_loopback_proxy_bypass,
+)
 
 
 class _FakeVectorStore:
@@ -57,6 +62,44 @@ class _FakeContainer:
 
 
 class FastAPIRefactorTests(unittest.TestCase):
+    def test_rag_anything_completion_uses_next_configured_model(self) -> None:
+        calls: list[str] = []
+
+        async def fake_completion(model, prompt, **kwargs):
+            calls.append(model)
+            if model == "quota-model":
+                raise RuntimeError("Free quota exhausted")
+            return "fallback answer"
+
+        with patch.object(settings, "llm_models", ["quota-model", "fallback-model"]):
+            result = asyncio.run(
+                _complete_with_model_pool(fake_completion, "question")
+            )
+
+        self.assertEqual(result, "fallback answer")
+        self.assertEqual(calls, ["quota-model", "fallback-model"])
+
+    def test_rag_anything_query_restores_persisted_lightrag_before_query(self) -> None:
+        class FakeRag:
+            def __init__(self) -> None:
+                self.initialized = False
+
+            async def _ensure_lightrag_initialized(self):
+                self.initialized = True
+                return {"success": True}
+
+            async def aquery(self, question, mode):
+                if not self.initialized:
+                    raise AssertionError("query ran before persisted storage initialization")
+                return "persisted answer"
+
+        reader = RagAnythingPaperReader.__new__(RagAnythingPaperReader)
+        reader.rag = FakeRag()
+
+        result = asyncio.run(reader.ask("question", mode="hybrid"))
+
+        self.assertEqual(result, "persisted answer")
+
     def test_mineru_loopback_requests_bypass_system_proxy(self):
         with patch.dict(
             os.environ,
