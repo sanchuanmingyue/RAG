@@ -22,6 +22,7 @@ _LIBRARY_SCOPE_KEYWORDS = (
     "已索引",
     "索引状态",
     "collection",
+    "library",
 )
 _LIBRARY_ACTION_KEYWORDS = (
     "多少",
@@ -36,6 +37,11 @@ _LIBRARY_ACTION_KEYWORDS = (
     "状态",
     "chunk",
     "文件",
+    "list",
+    "files",
+    "papers",
+    "how many",
+    "count",
 )
 
 
@@ -58,12 +64,21 @@ def is_corpus_analysis_query(text: str) -> bool:
     normalized = " ".join(text.lower().strip().split())
     has_action = any(
         keyword in normalized
-        for keyword in ("分类", "归类", "聚类", "分组", "分成", "分为", "划分")
+        for keyword in (
+            "分类", "归类", "聚类", "分组", "分成", "分为", "划分",
+            "classify", "cluster", "group", "categorize",
+        )
     )
-    has_subject = any(keyword in normalized for keyword in ("论文", "文章", "文献"))
+    has_subject = any(
+        keyword in normalized
+        for keyword in ("论文", "文章", "文献", "papers", "articles", "literature")
+    )
     has_batch_scope = any(
         keyword in normalized
-        for keyword in ("全部", "所有", "全库", "当前库", "知识库", "库中", "库里", "这些", "这批", "多篇")
+        for keyword in (
+            "全部", "所有", "全库", "当前库", "知识库", "库中", "库里", "这些", "这批", "多篇",
+            "all", "library", "corpus", "these",
+        )
     ) or bool(re.search(r"\d+\s*篇", normalized))
     return has_action and has_subject and has_batch_scope
 
@@ -78,8 +93,15 @@ class AgentRouter:
     # 关键词顺序很重要：更具体的意图放前面。
     # 例如“导出对比结果”同时包含“导出”和“对比”，实际应该优先执行导出。
     EXPORT_KEYWORDS = ("导出", "保存", "下载", "生成文件", "markdown", "json", "export")
-    COMPARE_KEYWORDS = ("对比", "比较", "差异", "共同点", "多篇", "文献综述", "综述", "compare")
-    SUMMARY_KEYWORDS = ("总结", "概括", "阅读笔记", "阅读卡片", "论文卡片", "创新点", "实验设置")
+    COMPARE_KEYWORDS = (
+        "对比", "比较", "差异", "共同点", "多篇", "各篇", "这几篇",
+        "这些论文", "这些文章", "分别在做什么", "分别做了什么",
+        "文献综述", "综述", "compare",
+    )
+    SUMMARY_KEYWORDS = (
+        "总结", "概括", "阅读笔记", "阅读卡片", "论文卡片", "创新点", "实验设置",
+        "summarize", "summary",
+    )
     SOURCE_KEYWORDS = ("来源", "引用", "证据", "原文", "片段", "页码", "依据", "source")
 
     def route(self, user_query: str) -> AgentIntent:

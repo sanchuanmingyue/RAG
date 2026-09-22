@@ -3,6 +3,7 @@
 from pathlib import Path
 import os
 import re
+import sys
 
 from dotenv import load_dotenv
 
@@ -12,6 +13,7 @@ PAPER_DIR = ROOT_DIR / "data" / "papers"
 VECTOR_DB_DIR = ROOT_DIR / "storage" / "vector_db"
 RAG_ANYTHING_DIR = ROOT_DIR / "storage" / "rag_anything"
 RAG_ANYTHING_OUTPUT_DIR = ROOT_DIR / "storage" / "rag_anything_output"
+CONVERSATION_DB_PATH = ROOT_DIR / "storage" / "conversations.db"
 
 load_dotenv(ROOT_DIR / ".env")
 
@@ -66,6 +68,11 @@ class Settings:
         ):
             self.llm_api_key = self.embedding_api_key
         self.embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small").strip()
+        self.embedding_batch_size = max(int(os.getenv("EMBEDDING_BATCH_SIZE", "10")), 1)
+        self.embedding_max_retries = max(int(os.getenv("EMBEDDING_MAX_RETRIES", "3")), 0)
+        self.embedding_retry_base_seconds = max(
+            float(os.getenv("EMBEDDING_RETRY_BASE_SECONDS", "1")), 0.0
+        )
         self.vision_base_url = (os.getenv("VISION_BASE_URL") or self.llm_base_url).strip()
         configured_vision_key = (os.getenv("VISION_API_KEY") or "").strip()
         if self.vision_base_url.rstrip("/") == self.embedding_base_url.rstrip("/"):
@@ -91,7 +98,18 @@ class Settings:
         self.section_support_chunks = int(os.getenv("SECTION_SUPPORT_CHUNKS", "3"))
         self.qa_source_max_chars = int(os.getenv("QA_SOURCE_MAX_CHARS", "2400"))
         self.qa_context_max_chars = int(os.getenv("QA_CONTEXT_MAX_CHARS", "12000"))
-        self.qa_max_tokens = int(os.getenv("QA_MAX_TOKENS", "600"))
+        self.qa_max_tokens = int(os.getenv("QA_MAX_TOKENS", "1200"))
+        self.qa_long_source_max_chars = int(os.getenv("QA_LONG_SOURCE_MAX_CHARS", "4200"))
+        self.qa_long_context_max_chars = int(os.getenv("QA_LONG_CONTEXT_MAX_CHARS", "40000"))
+        self.qa_long_max_tokens = int(os.getenv("QA_LONG_MAX_TOKENS", "3600"))
+        self.qa_long_models = _env_list("QA_LONG_MODELS", "") or self.llm_models
+        self.qa_long_enable_thinking = _env_bool("QA_LONG_ENABLE_THINKING", False)
+        self.qa_detailed_top_k = int(os.getenv("QA_DETAILED_TOP_K", "12"))
+        self.qa_planning_enabled = _env_bool("QA_PLANNING_ENABLED", True)
+        self.qa_plan_max_tokens = int(os.getenv("QA_PLAN_MAX_TOKENS", "900"))
+        self.qa_auto_continue = _env_bool("QA_AUTO_CONTINUE", True)
+        self.summary_max_tokens = int(os.getenv("SUMMARY_MAX_TOKENS", "1800"))
+        self.compare_max_tokens = int(os.getenv("COMPARE_MAX_TOKENS", "3600"))
         self.reference_section_penalty = float(os.getenv("REFERENCE_SECTION_PENALTY", "0.35"))
         self.enable_section_index = _env_bool("ENABLE_SECTION_INDEX", True)
         self.section_document_max_chars = int(os.getenv("SECTION_DOCUMENT_MAX_CHARS", "12000"))
@@ -146,6 +164,21 @@ class Settings:
         ).strip().rstrip("/")
         self.ieee_search_timeout_seconds = float(os.getenv("IEEE_SEARCH_TIMEOUT_SECONDS", "30"))
         self.ieee_search_default_limit = int(os.getenv("IEEE_SEARCH_DEFAULT_LIMIT", "10"))
+        self.arxiv_mcp_enabled = _env_bool("ARXIV_MCP_ENABLED", True)
+        self.arxiv_mcp_command = (os.getenv("ARXIV_MCP_COMMAND") or sys.executable).strip()
+        self.arxiv_mcp_args = _env_list("ARXIV_MCP_ARGS", "-m,arxiv_mcp_server")
+        configured_arxiv_storage = os.getenv("ARXIV_MCP_STORAGE_PATH", "").strip()
+        self.arxiv_mcp_storage_path = (
+            Path(configured_arxiv_storage)
+            if configured_arxiv_storage
+            else ROOT_DIR / "storage" / "arxiv_mcp"
+        )
+        self.arxiv_mcp_timeout_seconds = float(os.getenv("ARXIV_MCP_TIMEOUT_SECONDS", "90"))
+        self.arxiv_search_default_limit = int(os.getenv("ARXIV_SEARCH_DEFAULT_LIMIT", "5"))
+        self.conversation_user_id = os.getenv("CONVERSATION_USER_ID", "local_user").strip() or "local_user"
+        configured_conversation_db = os.getenv("CONVERSATION_DB_PATH", "").strip()
+        self.conversation_db_path = Path(configured_conversation_db) if configured_conversation_db else CONVERSATION_DB_PATH
+        self.conversation_message_limit = int(os.getenv("CONVERSATION_MESSAGE_LIMIT", "100"))
         self.api_max_upload_mb = int(os.getenv("API_MAX_UPLOAD_MB", "50"))
         self.api_background_workers = int(os.getenv("API_BACKGROUND_WORKERS", "2"))
         self.rag_anything_parser = os.getenv("RAG_ANYTHING_PARSER", "mineru").strip()
@@ -205,6 +238,10 @@ class Settings:
     @property
     def ieee_is_ready(self) -> bool:
         return bool(self.ieee_api_key and self.ieee_api_base_url)
+
+    @property
+    def arxiv_mcp_is_ready(self) -> bool:
+        return bool(self.arxiv_mcp_enabled and self.arxiv_mcp_command and self.arxiv_mcp_args)
 
 
 settings = Settings()

@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
-import threading
 from typing import Any
 
 import streamlit as st
 
 from backend.config import PAPER_DIR, RAG_ANYTHING_DIR, RAG_ANYTHING_OUTPUT_DIR, settings
+from backend.multimodal_service import MultimodalPaperService, multimodal_index_ready
 from backend.rag_anything_reader import (
-    RagAnythingPaperReader,
     check_rag_anything_dependencies,
     detect_compute_runtime,
 )
@@ -23,44 +21,9 @@ st.set_page_config(page_title="多模态论文阅读", page_icon="MM", layout="w
 apply_app_style()
 
 
-class AsyncLoopRunner:
-    """Run RAG-Anything coroutines on one persistent event loop."""
-
-    def __init__(self) -> None:
-        self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self._run_loop, name="rag-anything-loop", daemon=True)
-        self.thread.start()
-
-    def _run_loop(self) -> None:
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
-
-    def run(self, coro):
-        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        return future.result()
-
-
 @st.cache_resource
-def get_async_runner() -> AsyncLoopRunner:
-    return AsyncLoopRunner()
-
-
-def run_async(coro):
-    return get_async_runner().run(coro)
-
-
-async def create_reader() -> RagAnythingPaperReader:
-    try:
-        from lightrag.kg.shared_storage import finalize_share_data
-
-        finalize_share_data()
-    except Exception:
-        pass
-    return RagAnythingPaperReader()
-
-
-async def check_parser_ready(reader: RagAnythingPaperReader) -> bool:
-    return reader.parser_ready()
+def get_multimodal_service() -> MultimodalPaperService:
+    return MultimodalPaperService()
 
 
 def save_uploaded_document(uploaded_file) -> Path:
@@ -70,11 +33,6 @@ def save_uploaded_document(uploaded_file) -> Path:
     return file_path
 
 
-@st.cache_resource
-def get_reader() -> RagAnythingPaperReader:
-    return run_async(create_reader())
-
-
 def render_result(result: Any) -> None:
     if isinstance(result, (dict, list)):
         st.code(json.dumps(result, ensure_ascii=False, indent=2), language="json")
@@ -82,15 +40,6 @@ def render_result(result: Any) -> None:
         st.info("任务已完成，但 RAG-Anything 没有返回额外结果。")
     else:
         st.markdown(str(result))
-
-
-def multimodal_index_ready() -> bool:
-    """Ignore cache-only files; require actual LightRAG index artifacts."""
-
-    if not RAG_ANYTHING_DIR.exists():
-        return False
-    ignored = {".gitkeep", "kv_store_llm_response_cache.json"}
-    return any(path.name not in ignored for path in RAG_ANYTHING_DIR.iterdir())
 
 
 render_top_navigation("Multimodal", on_main_page=False)
@@ -156,8 +105,7 @@ with st.sidebar:
     if st.button("检查解析器"):
         with st.spinner("首次检查会按需初始化 RAG-Anything..."):
             try:
-                reader = get_reader()
-                ready = run_async(check_parser_ready(reader))
+                ready = get_multimodal_service().parser_ready()
             except Exception as exc:
                 st.error(f"解析器初始化失败：{exc}")
             else:
@@ -193,21 +141,19 @@ with left:
         st.session_state["rag_anything_last_file"] = str(file_path)
         parse_status = st.status("正在初始化多模态解析器...", expanded=True)
         try:
-            reader = get_reader()
+            service = get_multimodal_service()
             parse_status.write(
                 f"计算设备：{device.upper()}；后端：{settings.rag_anything_backend or 'default'}；正在启动 MinerU。"
             )
             parse_status.write("正在提取文本、版面、图片、表格和公式，首次运行还会加载模型。")
-            result = run_async(
-                reader.process_document(
-                    file_path,
-                    start_page=int(start_page) if use_page_range else None,
-                    end_page=int(end_page) if use_page_range else None,
-                    lang=lang or None,
-                    device=device,
-                    formula=False if fast_mode else None,
-                    table=False if fast_mode else None,
-                )
+            result = service.process_document(
+                file_path,
+                start_page=int(start_page) if use_page_range else None,
+                end_page=int(end_page) if use_page_range else None,
+                lang=lang or None,
+                device=device,
+                formula=False if fast_mode else None,
+                table=False if fast_mode else None,
             )
         except Exception as exc:
             parse_status.update(label="多模态解析失败", state="error", expanded=True)
@@ -237,7 +183,7 @@ with right:
     ):
         with st.spinner("正在进行混合检索和生成回答..."):
             try:
-                result = run_async(get_reader().ask(question.strip(), mode=mode))
+                result = get_multimodal_service().ask(question.strip(), mode=mode)
             except Exception as exc:
                 st.error(f"多模态问答失败：{exc}")
             else:
@@ -264,12 +210,10 @@ with st.expander("直接多模态内容问答"):
         else:
             with st.spinner("正在调用 RAG-Anything 多模态问答接口..."):
                 try:
-                    result = run_async(
-                        get_reader().ask_with_content(
-                            direct_question.strip(),
-                            multimodal_content=multimodal_content,
-                            mode=mode,
-                        )
+                    result = get_multimodal_service().ask_with_content(
+                        direct_question.strip(),
+                        multimodal_content=multimodal_content,
+                        mode=mode,
                     )
                 except Exception as exc:
                     st.error(f"直接多模态问答失败：{exc}")

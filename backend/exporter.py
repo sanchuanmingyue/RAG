@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from dataclasses import asdict
 import json
 from pathlib import Path
 import re
@@ -85,6 +86,7 @@ class Exporter:
             "last_answer": memory.last_answer,
             "last_sources": memory.last_sources,
             "generated_cards": memory.generated_cards,
+            "conversation_state": asdict(memory.state),
             "history": [turn.__dict__ for turn in memory.history],
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -2,7 +2,7 @@
 
 面向科研论文阅读与文献整理的本地 RAG 应用。系统支持 PDF 解析、基于证据的问答、结构化阅读笔记、多篇论文对比与结果导出；可按需接入 RAG-Anything，解析论文中的文本、图像、表格和公式。
 
-> 核心技术：Python · FastAPI · Streamlit · Chroma · BGE-M3 · RAG-Anything · OpenAI-compatible LLM API
+> 核心技术：Python · LangGraph · MCP · FastAPI · Streamlit · Chroma · BGE-M3 · BGE-Reranker · RAG-Anything
 
 ## 项目展示
 
@@ -13,20 +13,31 @@
 ## 架构
 
 ```mermaid
-flowchart LR
-    A[PDF 论文] --> B[PyMuPDF / RAG-Anything]
-    B --> C[文本、图片、表格、公式解析]
-    C --> D[章节感知切分与元数据]
-    D --> E[BGE-M3 Embedding]
-    E --> F[(Chroma 向量库)]
-    U[用户问题] --> G[意图识别与 Query Rewrite]
-    G --> H[两阶段混合检索]
-    F --> H
-    H --> I[章节聚合与 Reranker]
-    I --> J[LLM 证据问答]
-    J --> K[引用校验 / 拒答控制]
-    K --> L[流式回答、阅读笔记、论文对比]
+flowchart TD
+    U[Agent / API 请求] --> A[LangGraph 单 Agent]
+    A --> R{任务路由}
+    R -->|本地论文问答| Q[Query Rewrite / Hybrid RAG]
+    R -->|明确要求 arXiv| X[arXiv MCP: search_papers]
+    R -->|普通外部检索| I[IEEE Xplore API]
+    R -->|总结 / 对比 / 分类| T[论文阅读工具]
+    P[PDF / RAG-Anything] --> C[跨页章节 Parent + Child Chunk]
+    C --> E[BGE-M3 Embedding]
+    E --> V[(Chroma)]
+    V --> Q
+    Q --> B[BGE-Reranker]
+    B --> G{证据充分?}
+    G -->|否，仅重试一次| W[改写检索问题]
+    W --> Q
+    G -->|是| O[回答 + 可核验引用]
+    X --> O
+    I --> O
+    T --> O
+    A <--> S[(SQLite 会话库)]
 ```
+
+主 Chat 统一执行意图识别：普通论文问答保留逐字流式 RAG，文献搜索、总结、对比、来源解释、
+导出、知识库状态和全库分类自动调用对应 Agent 工具。`POST /api/v1/agent` 使用相同的 LangGraph
+工作流。Chat 中还可通过“多模态”开关按需切换到 RAG-Anything。
 
 ## Benchmark 结果
 
@@ -61,16 +72,21 @@ uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
 ## 功能
 
 - 上传一篇或多篇 PDF 论文
-- 顶部 Search 页面支持自然语言 IEEE Xplore 文献检索；Chat 中的“查找论文”请求可自动切换到外部检索
+- 顶部 Search 页面同时支持 IEEE Xplore 与 arXiv MCP；Chat 中的自然语言检索请求可自动选择来源
+- LangGraph 单 Agent 统一执行任务路由、本地问答、外部搜索、证据判断、Query Rewrite 和一次自动重检索
+- arXiv 使用本地 `arxiv-mcp-server` 的 stdio 工具调用；普通外部检索默认使用 IEEE，明确提到 arXiv/预印本时切换至 MCP
 - 使用 PyMuPDF 按页解析文本
 - 将文本切成 chunk，并保留 `paper_id`、`file_name`、`page`、`chunk_id`
+- 默认将跨页的同一章节合并为 Parent，再按段落/句子边界生成 Child Chunk；保留起止页和完整页码范围
 - 使用 OpenAI-compatible API 生成 embedding 和回答
 - 使用 Chroma 作为本地向量数据库
 - 问答时返回引用页码和检索片段
 - 生成论文阅读笔记：研究背景、研究问题、核心方法、创新点、实验设置、实验结果、优点、缺点、可改进方向
 - Agent Router 自动识别问答、总结、对比、来源解释、导出、知识库状态、外部文献检索和全库分类意图
 - 全库分类复用已持久化的章节向量，按 Abstract、Introduction、Related Work 的研究背景语义聚类，无需逐篇重新生成 embedding
-- Memory 保存当前论文、选中的多篇论文、历史问题、最近来源和已生成阅读卡片
+- 多轮追问通过 Conversation State 继承上一轮意图；分类结果操作直接读取结构化 Artifact，普通论文追问先改写成独立检索问题
+- SQLite 持久化会话消息、当前意图、检索范围和结构化 Artifact；刷新页面或重启服务后可继续历史会话
+- Memory 作为当前请求的热状态，保存当前论文、选中的多篇论文、最近来源和已生成阅读卡片
 - 多篇论文对比：先生成单篇阅读卡片，再基于卡片生成 Markdown 对比表
 - 支持将最近结果、来源片段、阅读卡片和会话记录导出为 Markdown 或 JSON
 - Evaluator 支持空来源拒答，并可通过 `RETRIEVAL_MAX_DISTANCE` 配置检索距离阈值
@@ -93,10 +109,12 @@ uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
 ├── data/
 │   └── papers/
 ├── storage/
+│   ├── conversations.db
 │   ├── exports/
 │   └── vector_db/
 └── backend/
     ├── agent.py
+    ├── arxiv_mcp.py
     ├── config.py
     ├── evaluator.py
     ├── exporter.py
@@ -104,6 +122,8 @@ uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
     ├── text_splitter.py
     ├── embeddings.py
     ├── memory.py
+    ├── conversation.py
+    ├── conversation_store.py
     ├── vector_store.py
     ├── rag_chain.py
     ├── prompts.py
@@ -126,8 +146,31 @@ LLM_MODEL
 EMBEDDING_API_KEY
 EMBEDDING_BASE_URL
 EMBEDDING_MODEL
+EMBEDDING_BATCH_SIZE
+EMBEDDING_MAX_RETRIES
 IEEE_API_KEY
+ARXIV_MCP_ENABLED
+ARXIV_MCP_COMMAND
+ARXIV_MCP_ARGS
+CONVERSATION_USER_ID
+CONVERSATION_DB_PATH
+CONVERSATION_MESSAGE_LIMIT
 ```
+
+默认会话库位于 `storage/conversations.db`，无需单独安装数据库服务。当前本地演示版使用
+`local_user` 隔离数据；后续接入登录时可将认证后的用户 ID 写入 `CONVERSATION_USER_ID`。
+
+arXiv MCP 默认直接使用当前 Python 环境启动，无需 API Key，也无需单独安装 `uvx`：
+
+```text
+ARXIV_MCP_ENABLED=true
+ARXIV_MCP_COMMAND=
+ARXIV_MCP_ARGS=-m,arxiv_mcp_server
+ARXIV_MCP_TIMEOUT_SECONDS=90
+ARXIV_SEARCH_DEFAULT_LIMIT=5
+```
+
+`ARXIV_MCP_COMMAND` 留空时自动使用运行应用的 Python；依赖已固定在 `requirements.txt`。
 
 生成模型支持按顺序自动切换的阿里云模型池。所有模型复用同一个 DashScope API Key 和
 OpenAI 兼容地址，模型 ID 通过模型服务控制台配置：
@@ -181,15 +224,23 @@ Streamlit 现在是可选的交互界面，和 FastAPI 共用 `backend/services.
 streamlit run app.py
 ```
 
-主界面采用“固定文件侧边栏 + 双栏阅读区”：左侧上传、选择论文和切换检索范围，主区域左栏进行
-流式论文问答、右栏按页预览 PDF 原文；顶部 `Chat / Search / Files / Tools / Multimodal` 作为主导航，
-`Search` 将自然语言需求转换为英文检索式并查询 IEEE Xplore，结果保留 DOI、稳定链接与透明评分；
-`Files` 集中管理本地文件和索引状态，`Tools` 保留 Agent、阅读笔记、
-多论文对比及导出。PDF 预览采用逐页渲染，大文件不会在首屏一次性传入浏览器。
+主界面采用类似研究工作台的三栏架构：左侧管理会话、论文集合和检索范围，中间统一承载流式问答与
+Agent 指令，右侧信息面板集中展示引用证据、章节、页码、检索评分和按页 PDF 原文；顶部
+`Chat / Files / Search / Tools` 作为主导航，
+`Search` 可选择 IEEE Xplore 或 arXiv MCP：前者保留 DOI、稳定链接与透明评分，后者展示
+arXiv ID、分类、摘要和实际 MCP 工具参数；
+`Files` 集中管理本地文件和索引状态，`Tools` 保留阅读笔记、多论文对比、导出和检索调试。
+Agent 意图识别已集成进 Chat；多模态索引仍可从侧边栏管理，是否用于回答则由 Chat 顶部开关控制。
+PDF 预览采用逐页渲染，大文件不会在首屏一次性传入浏览器。
 
-论文问答页使用流式生成，并在完成后展示最终引用校验结果、章节路径、页码、模型、拒答原因以及
-检索/生成耗时。单篇论文自动返回 Top-5 章节，选择“全部论文”时自动扩大到 Top-10；仍可通过 API
-中的 `top_k` 显式覆盖。`QA_MAX_TOKENS=600` 仅限制普通论文问答，不限制阅读笔记和多论文对比。
+论文问答页使用流式生成，并在完成后展示最终引用校验结果、章节路径、页码、模型、回答模式以及
+检索/生成耗时。普通单篇事实题使用 Top-5 和 `QA_MAX_TOKENS=1200`；“详细、全面、逐章、为什么、
+多篇对比”等问题会自动进入深度综合模式，先生成内部证据提纲，再使用 Top-12、最多 40000 字符上下文
+和 `QA_LONG_MAX_TOKENS=3600` 完成写作。选择全部论文时默认检索 Top-16；如果模型因长度上限停止，
+`QA_AUTO_CONTINUE=true` 会自动续写一次。API 中的 `top_k` 仍可显式覆盖这些默认值。阅读卡片与多论文
+对比分别由 `SUMMARY_MAX_TOKENS` 和 `COMPARE_MAX_TOKENS` 控制。`QA_LONG_MODELS` 可为深度任务指定更强的
+模型顺序；`QA_LONG_ENABLE_THINKING=false` 默认使用显式的“多查询取证 → 证据规划 → 综合写作”流程，
+避免供应商隐藏思考模式造成数分钟无输出。
 
 多模态页面采用按需初始化：打开页面时只检测依赖、GPU 和已有索引，点击“检查解析器”或正式解析时
 才加载 RAG-Anything。`RAG_ANYTHING_DEVICE=auto` 会在 CUDA 可用时选择 GPU；也可以显式设为
@@ -210,6 +261,7 @@ Windows 环境会自动让 MinerU 的 localhost 健康检查绕过系统代理�
 - `POST /api/v1/chat`：执行检索增强问答。
 - `POST /api/v1/chat/stream`：以 SSE 流式返回 `meta`、`delta`、`done`/`error` 事件。
 - `POST /api/v1/literature/search`：使用自然语言检索 IEEE Xplore 文献元数据。
+- `POST /api/v1/literature/arxiv/search`：通过本地 arXiv MCP Server 检索预印本文献。
 - `POST /api/v1/summaries`：生成单篇论文阅读卡片。
 - `POST /api/v1/agent`：按 `session_id` 保存独立的 Agent 记忆。
 - `DELETE /api/v1/sessions/{session_id}`：清除对应会话记忆。
@@ -251,8 +303,8 @@ curl.exe -N -X POST "http://127.0.0.1:8000/api/v1/chat/stream" `
 3. 在中间问答区输入问题，答案会流式显示；在右侧用页码跳转对照 PDF 原文。
 4. 查看最终答案、引用章节、页码、拒答原因、模型和分阶段耗时。
 5. 进入 `Search` 描述主题和年份范围，或在 `Chat` 中直接输入“帮我查找……论文”。
-6. 进入 `Tools` 生成阅读笔记、多论文对比或导出结果。
-7. 在“Agent 工作台”中输入“总结这篇论文”“比较选中的论文”“解释刚才的来源”“导出 Markdown”等指令。
+6. 直接在 Chat 输入“总结这篇论文”“比较选中的论文”“解释刚才的来源”“导出 Markdown”等指令，系统会自动识别意图。
+7. 如需图片、表格和公式问答，在 Chat 顶部开启“多模态”；索引尚未建立时进入侧边栏的多模态索引管理。
 8. 在左侧选择多篇论文后，进入“多论文对比与导出”生成对比表或导出结果。
 9. 打开检索调试页面，查看 Chroma 中的 chunk、元数据和排序结果。
 
@@ -262,8 +314,10 @@ curl.exe -N -X POST "http://127.0.0.1:8000/api/v1/chat/stream" `
 
 ```text
 用户输入
-  -> backend/router.py 判断意图
-  -> backend/tools.py 调用问答、总结、对比、来源解释、知识库状态、IEEE 检索、全库分类或导出工具
+  -> backend/conversation.py 判断新问题/追问并解析上下文
+  -> backend/agent.py 的 LangGraph 判断或继承意图
+  -> backend/tools.py 调用问答、总结、对比、来源解释、知识库状态、IEEE/arXiv 检索、全库分类或导出工具
+  -> 本地问答证据不足时改写查询并自动重检索一次
   -> backend/evaluator.py 检查 sources 和拒答条件
   -> backend/memory.py 更新当前论文、阅读卡片、最近来源和会话历史
   -> Streamlit 展示答案、来源和导出路径
@@ -348,6 +402,10 @@ API reranker 预热只检查配置，不发请求、不消耗额度；仅当切�
 模型，但展示给用户和 LLM 的原始 chunk 文本不会改变。因此，已有论文库需要在方便时重新“解析并建立索引”
 才会获得这一项向量层面的章节收益；不需要重建也可立即获得缓存、标题加分和章节去重的收益。
 
+系统统一使用跨页章节 Parent 和段落/句子感知 Child，不再保留页面内固定字符切分分支。
+`CHUNK_SIZE` 和 `CHUNK_OVERLAP` 分别控制子块字符预算与相邻上下文重叠；历史固定切分评测结果仅作为
+离线实验记录保留，不参与当前索引流程。
+
 要和已有 `hybrid_top5` 结果做可复现的 A/B，请使用新 collection（避免覆盖旧基准）并保持题数、文档数与
 随机种子一致：
 
@@ -361,6 +419,29 @@ python scripts\run_open_rag_bench.py `
 
 该命令会为 benchmark 语料调用 embedding API；首次运行后可去掉 `--rebuild`，用于只测查询阶段。
 评测启动前会执行预热，因此查询时延不再混入关键词索引构建和模型首次加载耗时。
+Embedding 请求遇到 429、5xx 或供应商 ALB 返回的 HTML 400 时会指数退避重试；索引中断后，使用
+相同参数和 collection、去掉 `--rebuild` 重新执行即可按 `chunk_id` 续跑，不会重复生成已保存向量。
+如果持续失败，可在 `.env` 中将 `EMBEDDING_BATCH_SIZE` 从 10 调低为 5。
+
+## 意图路由评测
+
+路由意图评测集位于 `data/intent_eval.jsonl`，覆盖 8 类项目意图以及带上一轮状态的追问。默认评测
+完全走规则和会话状态，不调用模型、不消耗额度：
+
+```powershell
+python scripts\evaluate_intent_router.py --subset all
+python scripts\evaluate_intent_router.py --subset single-turn
+python scripts\evaluate_intent_router.py --subset contextual
+```
+
+加入 CI 门槛时可执行：
+
+```powershell
+python scripts\evaluate_intent_router.py --subset all --min-accuracy 0.95 --min-macro-f1 0.95
+```
+
+如需同时测试歧义追问的线上模型兜底，可增加 `--use-llm-fallback`；该模式会产生模型调用费用。
+逐条预测、混淆项和错误样本会保存到 `storage/evals/intent_router_*.json`。
 
 ## 文献阅读验收测试
 

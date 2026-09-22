@@ -28,6 +28,8 @@ from api.schemas import (
     TaskResponse,
 )
 from backend.config import PAPER_DIR, settings
+from backend.arxiv_mcp import ArxivSearchService
+from backend.conversation_store import ConversationStore
 from backend.ieee_search import LiteratureSearchService
 from backend.services import AgentSessionStore, BackgroundTaskManager, PaperService
 
@@ -37,10 +39,14 @@ class APIContainer:
 
     def __init__(self) -> None:
         self.paper_service = PaperService()
+        self.conversation_store = ConversationStore()
         self.literature_search_service = LiteratureSearchService(
             llm_client=self.paper_service.llm_client if settings.is_ready else None
         )
-        self.sessions = AgentSessionStore()
+        self.arxiv_search_service = ArxivSearchService(
+            llm_client=self.paper_service.llm_client if settings.llm_is_ready else None
+        )
+        self.sessions = AgentSessionStore(self.conversation_store)
         self.tasks = BackgroundTaskManager(max_workers=settings.api_background_workers)
 
     def close(self) -> None:
@@ -64,6 +70,14 @@ def _require_ieee_configuration() -> None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="IEEE_API_KEY 尚未配置，请检查 .env。",
+        )
+
+
+def _require_arxiv_configuration() -> None:
+    if not settings.arxiv_mcp_is_ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="arXiv MCP 尚未启用，请检查 ARXIV_MCP_* 配置。",
         )
 
 
@@ -248,6 +262,24 @@ async def literature_search(
         raise _translate_operation_error(exc) from exc
 
 
+@router.post("/literature/arxiv/search")
+async def arxiv_literature_search(
+    payload: LiteratureSearchRequest,
+    container: APIContainer = Depends(_get_container),
+) -> dict:
+    """Search arXiv through the configured local MCP stdio server."""
+
+    _require_arxiv_configuration()
+    try:
+        return await run_in_threadpool(
+            container.arxiv_search_service.search,
+            payload.query,
+            limit=payload.limit,
+        )
+    except Exception as exc:
+        raise _translate_operation_error(exc) from exc
+
+
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
@@ -303,6 +335,13 @@ async def agent(payload: AgentRequest, container: APIContainer = Depends(_get_co
         with container.sessions.session(session_id) as memory:
             memory.set_scope(payload.current_paper_id, payload.selected_paper_ids)
             result = container.paper_service.run_agent(payload.prompt, memory)
+            container.sessions.persist_exchange(
+                session_id,
+                user_content=payload.prompt,
+                assistant_content=result["answer"],
+                intent=result["intent"],
+                memory=memory,
+            )
         return {"session_id": session_id, **result}
 
     try:

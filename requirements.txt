@@ -9,6 +9,10 @@ pymupdf>=1.24.0
 chromadb>=0.5.0
 sentence-transformers>=3.0.0
 scikit-learn>=1.3.0
+langgraph>=1.2.0,<2.0.0
+# arXiv MCP server and its compatible Python MCP client (stdio transport).
+arxiv-mcp-server==0.7.2
+mcp>=1.27.0,<2.0.0
 # Keep the multimodal PDF stack on the mutually compatible MinerU 3.x /
 # Transformers 4.x line. Transformers 5 removed APIs used by MinerU's MFR model.
 raganything[image,text,paddleocr,markdown]==1.4.1

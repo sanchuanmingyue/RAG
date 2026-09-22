@@ -61,10 +61,23 @@ class _FakeLiteratureSearchService:
         }
 
 
+class _FakeArxivSearchService:
+    def search(self, query, *, limit=10):
+        return {
+            "source": "arXiv MCP",
+            "request": query,
+            "returned": 1,
+            "results": [{"title": "Verified arXiv Paper", "rank": 1}],
+            "query_plan": {"querytext": "verified arxiv query"},
+            "mcp": {"server": "arxiv-mcp-server", "tool": "search_papers"},
+        }
+
+
 class _FakeContainer:
     def __init__(self) -> None:
         self.paper_service = _FakePaperService()
         self.literature_search_service = _FakeLiteratureSearchService()
+        self.arxiv_search_service = _FakeArxivSearchService()
         self.sessions = AgentSessionStore()
         self.tasks = BackgroundTaskManager(max_workers=1)
 
@@ -264,6 +277,43 @@ class FastAPIRefactorTests(unittest.TestCase):
         self.assertTrue(call["stream"])
         self.assertEqual(call["extra_body"], {"enable_thinking": False})
 
+    def test_embedding_retries_transient_html_alb_400(self) -> None:
+        class GatewayError(Exception):
+            status_code = 400
+
+        class FakeEmbeddings:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise GatewayError("<html><center>400 Bad Request</center><center>alb</center></html>")
+                item = type("Embedding", (), {"embedding": [0.1, 0.2]})()
+                return type("Response", (), {"data": [item]})()
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs) -> None:
+                self.embeddings = FakeEmbeddings()
+                self.chat = type("Chat", (), {"completions": object()})()
+
+        environment = {
+            "LLM_API_KEY": "key",
+            "LLM_BASE_URL": "https://provider.example/v1",
+            "LLM_MODEL": "model",
+            "EMBEDDING_API_KEY": "key",
+            "EMBEDDING_BASE_URL": "https://provider.example/v1",
+            "EMBEDDING_MODEL": "embedding-model",
+            "EMBEDDING_MAX_RETRIES": "2",
+            "EMBEDDING_RETRY_BASE_SECONDS": "0",
+        }
+        with patch.dict("os.environ", environment, clear=False):
+            configured = Settings()
+        client = OpenAICompatibleClient(config=configured, client_factory=FakeOpenAI)
+
+        self.assertEqual(client.embed_texts(["chunk"]), [[0.1, 0.2]])
+        self.assertEqual(client.embedding_client.embeddings.calls, 2)
+
     def test_qa_stream_applies_output_token_limit(self) -> None:
         class FakeCompletions:
             def __init__(self) -> None:
@@ -292,6 +342,47 @@ class FastAPIRefactorTests(unittest.TestCase):
 
         self.assertEqual("".join(client.chat_stream_qa([{"role": "user", "content": "hi"}])), "bounded")
         self.assertEqual(client.chat_client.chat.completions.kwargs[0]["max_tokens"], 321)
+
+    def test_long_form_generation_continues_once_after_length_finish(self) -> None:
+        class FakeCompletions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create(self, **kwargs):
+                self.calls += 1
+                content = "第一部分" if self.calls == 1 else "第二部分"
+                finish_reason = "length" if self.calls == 1 else "stop"
+                message = type("Message", (), {"content": content})()
+                choice = type(
+                    "Choice",
+                    (),
+                    {"message": message, "finish_reason": finish_reason},
+                )()
+                return type("Response", (), {"choices": [choice]})()
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs) -> None:
+                self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+                self.embeddings = object()
+
+        environment = {
+            "LLM_API_KEY": "key", "LLM_BASE_URL": "https://provider.example/v1",
+            "LLM_MODELS": "plain-model", "QA_AUTO_CONTINUE": "true",
+            "EMBEDDING_API_KEY": "key", "EMBEDDING_BASE_URL": "https://embedding.example/v1",
+            "EMBEDDING_MODEL": "embedding-model",
+        }
+        with patch.dict("os.environ", environment, clear=False):
+            configured = Settings()
+        client = OpenAICompatibleClient(config=configured, client_factory=FakeOpenAI)
+
+        answer = client.chat_long_form(
+            [{"role": "user", "content": "write"}],
+            max_tokens=100,
+        )
+
+        self.assertEqual(answer, "第一部分\n\n第二部分")
+        self.assertEqual(client.chat_client.chat.completions.calls, 2)
+        self.assertTrue(client.last_chat_metadata["continuation_attempted"])
 
     def test_chat_stream_ignores_empty_usage_chunks(self) -> None:
         class FakeCompletions:
@@ -344,8 +435,16 @@ class FastAPIRefactorTests(unittest.TestCase):
 
         service.retrieve("single", paper_id="p1")
         service.retrieve("multi")
+        service.retrieve("详细介绍这篇论文的方法设计", paper_id="p1")
 
-        self.assertEqual(store.top_ks, [5, 10])
+        self.assertEqual(
+            store.top_ks,
+            [
+                settings.retrieval_top_k,
+                settings.multi_paper_top_k,
+                settings.qa_detailed_top_k,
+            ],
+        )
 
     def test_agent_sessions_are_isolated(self) -> None:
         sessions = AgentSessionStore()
@@ -433,3 +532,16 @@ class FastAPIRefactorTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["results"][0]["title"], "Verified IEEE Paper")
+
+    def test_arxiv_mcp_search_endpoint_accepts_natural_language(self) -> None:
+        app = create_app(_FakeContainer)
+        with patch.object(settings, "arxiv_mcp_enabled", True):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/v1/literature/arxiv/search",
+                    json={"query": "查找 arXiv 上的多模态 RAG 论文", "limit": 5},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["source"], "arXiv MCP")
+        self.assertEqual(response.json()["results"][0]["title"], "Verified arXiv Paper")

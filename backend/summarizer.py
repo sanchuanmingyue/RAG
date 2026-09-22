@@ -31,6 +31,15 @@ def generate_paper_note(
         return {"note": "论文中没有找到明确依据。", "sources": []}
 
     messages = build_summary_messages(hits)
-    note = llm_client.chat(messages, temperature=0.1)
+    note = llm_client.chat_long_form(
+        messages,
+        temperature=0.1,
+        max_tokens=settings.summary_max_tokens,
+        model_candidates=settings.qa_long_models,
+        enable_thinking=settings.qa_long_enable_thinking,
+        continuation_instruction=(
+            "上一段论文阅读卡片因长度限制中断。请从中断处继续，补完尚未完成的栏目，"
+            "不要重复已写内容，继续沿用原来源编号。只输出续写正文。"
+        ),
+    )
     return {"note": note, "sources": hits}
-

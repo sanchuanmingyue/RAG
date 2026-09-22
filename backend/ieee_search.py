@@ -15,6 +15,7 @@ from backend.config import settings
 
 _SEARCH_PATTERNS = (
     r"(?:查找|搜索|检索|找|推荐|搜)(?:一下|一些|几篇|相关)?(?:论文|文献|文章)",
+    r"(?:查找|搜索|检索|找|推荐|搜).{0,40}(?:论文|文献|文章)",
     r"(?:论文|文献)(?:检索|搜索|推荐)",
     r"IEEE\s*(?:论文|文献|paper)",
     r"(?:find|search|recommend|look\s+for).{0,20}(?:papers?|literature|articles?)",
@@ -48,6 +49,40 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+_CHINESE_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
+
+def _parse_year_count(value: str) -> int | None:
+    """Parse a small Arabic or Chinese year count used in relative ranges."""
+
+    normalized = value.strip()
+    if normalized.isdigit():
+        return int(normalized)
+    if normalized == "十":
+        return 10
+    if "十" in normalized:
+        tens, ones = normalized.split("十", 1)
+        tens_value = _CHINESE_DIGITS.get(tens, 1) if tens else 1
+        ones_value = _CHINESE_DIGITS.get(ones, 0) if ones else 0
+        return tens_value * 10 + ones_value
+    if len(normalized) == 1:
+        return _CHINESE_DIGITS.get(normalized)
+    return None
+
+
 def _extract_year_range(text: str) -> tuple[int | None, int | None]:
     current_year = datetime.now().year
     range_match = re.search(r"\b(19\d{2}|20\d{2})\s*(?:年)?\s*[-—~～到至]\s*(19\d{2}|20\d{2})", text)
@@ -60,30 +95,48 @@ def _extract_year_range(text: str) -> tuple[int | None, int | None]:
     before_match = re.search(r"\b(19\d{2}|20\d{2})\s*年?\s*(?:以前|之前|及以前|or earlier|before)", text, re.I)
     if before_match:
         return None, int(before_match.group(1))
-    recent_match = re.search(r"(?:近|最近|last|past)\s*(\d{1,2})\s*(?:年|years?)", text, re.I)
+    recent_match = re.search(
+        r"(?:近|最近|过去|last|past)\s*(\d{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*(?:年|years?)",
+        text,
+        re.I,
+    )
     if recent_match:
-        years = min(max(int(recent_match.group(1)), 1), 30)
-        return current_year - years + 1, current_year
+        parsed_years = _parse_year_count(recent_match.group(1))
+        if parsed_years is not None:
+            years = min(max(parsed_years, 1), 30)
+            return current_year - years + 1, current_year
     years = [int(value) for value in re.findall(r"\b(?:19\d{2}|20\d{2})\b", text)]
     return (years[0], years[0]) if len(years) == 1 else (None, None)
 
 
 def _fallback_keywords(text: str) -> str:
     cleaned = re.sub(
-        r"(?:请|帮我|给我|一下|一些|几篇|查找|搜索|检索|寻找|找|推荐|相关的?|关于|论文|文献|文章|IEEE)",
+        r"(?:请|帮我|给我|一下|一些|几篇|查找|搜索|检索|寻找|找|推荐|相关的?|关于|论文|文献|文章|IEEE|arXiv|预印本|预印版|"
+        r"\b(?:please|find|search|look\s+for|recommend|show\s+me)\b|"
+        r"\b(?:papers?|literature|articles?|preprints?)\b|\b(?:about|on|related\s+to)\b)",
         " ",
         text,
         flags=re.IGNORECASE,
     )
-    cleaned = re.sub(r"\b(?:19\d{2}|20\d{2})\b|(?:年|以后|以来|之后|以前|之前|近|最近)\s*\d*\s*年?", " ", cleaned)
-    return " ".join(cleaned.split()).strip(" ，。,.；;:") or " ".join(text.split())
+    cleaned = re.sub(
+        r"\b(?:19\d{2}|20\d{2})\b|"
+        r"(?:近|最近|过去|last|past)\s*(?:\d{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*(?:年|years?)|"
+        r"(?:年|以后|以来|之后|以前|之前)",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    normalized = " ".join(cleaned.split()).strip(" ，。,.；;:")
+    normalized = normalized.rstrip("的").strip()
+    return normalized or " ".join(text.split())
 
 
 class IEEEQueryPlanner:
     """Translate a natural-language request into a compact IEEE query."""
 
-    def __init__(self, llm_client: Any | None = None) -> None:
+    def __init__(self, llm_client: Any | None = None, *, provider: str = "IEEE Xplore") -> None:
         self.llm_client = llm_client
+        self.provider = provider
 
     def plan(self, request: str) -> SearchPlan:
         start_year, end_year = _extract_year_range(request)
@@ -96,7 +149,7 @@ class IEEEQueryPlanner:
         if self.llm_client is None:
             return fallback
 
-        prompt = f"""你是 IEEE Xplore 检索式规划器。把用户的中文或英文需求转换成简洁的英文主题检索式。
+        prompt = f"""你是 {self.provider} 检索式规划器。把用户的中文或英文需求转换成简洁的英文主题检索式。
 只输出一个 JSON 对象，格式：
 {{"querytext":"英文关键词或 AND/OR 布尔表达式","start_year":2022,"end_year":2026,"explanation":"一句中文说明"}}
 规则：不要添加用户未提及的方法或领域；年份未知时填 null；querytext 不要包含年份；不要输出 Markdown。

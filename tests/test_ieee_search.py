@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import unittest
 
 import httpx
@@ -36,6 +37,13 @@ class IEEESearchTests(unittest.TestCase):
         plan = IEEEQueryPlanner(_FakeLLM()).plan("查找 2022 到 2025 年的多模态 RAG 论文")
         self.assertEqual(plan.querytext, "multimodal RAG AND scientific documents")
         self.assertEqual((plan.start_year, plan.end_year), (2022, 2025))
+
+    def test_planner_understands_chinese_relative_years(self) -> None:
+        current_year = datetime.now().year
+        plan = IEEEQueryPlanner().plan("帮我搜索近两年边缘计算的相关文章")
+
+        self.assertEqual((plan.start_year, plan.end_year), (current_year - 1, current_year))
+        self.assertEqual(plan.querytext, "边缘计算")
 
     def test_normalizes_filters_deduplicates_and_scores_results(self) -> None:
         payload = {

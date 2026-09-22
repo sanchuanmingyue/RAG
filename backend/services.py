@@ -14,10 +14,12 @@ from uuid import uuid4
 
 from backend.agent import ResearchAgent
 from backend.config import settings
+from backend.conversation_store import ConversationStore
 from backend.embeddings import OpenAICompatibleClient
 from backend.memory import AgentMemory
 from backend.pdf_loader import load_pdf_pages, normalize_paper_id
-from backend.rag_chain import PaperRAG
+from backend.prompts import is_long_form_question
+from backend.rag_chain import PaperRAG, QueryAnalysis
 from backend.summarizer import generate_paper_note
 from backend.text_splitter import split_pages
 from backend.vector_store import ChromaVectorStore
@@ -120,7 +122,7 @@ class PaperService:
         retrieval_mode: str | None = None,
         expand_parent: bool | None = None,
     ) -> dict[str, Any]:
-        resolved_top_k = self._resolve_top_k(paper_id, top_k)
+        resolved_top_k = self._resolve_top_k(paper_id, top_k, question)
         with self._operation_lock:
             hits = self.vector_store.query(
                 query_text=question,
@@ -139,16 +141,18 @@ class PaperService:
         *,
         paper_id: str | None = None,
         top_k: int | None = None,
+        retrieval_question: str | None = None,
         retrieval_mode: str | None = None,
         expand_parent: bool | None = None,
     ) -> dict[str, Any]:
         started = perf_counter()
-        resolved_top_k = self._resolve_top_k(paper_id, top_k)
+        resolved_top_k = self._resolve_top_k(paper_id, top_k, question)
         with self._operation_lock:
             result = PaperRAG(self.vector_store, self.llm_client).answer(
                 question,
                 paper_id=paper_id,
                 top_k=resolved_top_k,
+                retrieval_question=retrieval_question,
                 retrieval_mode=retrieval_mode,
                 expand_parent=expand_parent,
             )
@@ -169,17 +173,19 @@ class PaperService:
         *,
         paper_id: str | None = None,
         top_k: int | None = None,
+        retrieval_question: str | None = None,
         retrieval_mode: str | None = None,
         expand_parent: bool | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Retrieve under the store lock, then stream generation without it."""
 
         started = perf_counter()
-        resolved_top_k = self._resolve_top_k(paper_id, top_k)
+        resolved_top_k = self._resolve_top_k(paper_id, top_k, question)
         rag = PaperRAG(self.vector_store, self.llm_client)
+        resolved_question = retrieval_question or question
         with self._operation_lock:
-            hits, analysis = rag.retrieve_hits(
-                question,
+            hits, retrieval_analysis = rag.retrieve_hits(
+                resolved_question,
                 paper_id=paper_id,
                 top_k=resolved_top_k,
                 retrieval_mode=retrieval_mode,
@@ -188,7 +194,19 @@ class PaperService:
             timings = dict(self.vector_store.last_query_timings_ms)
         retrieved_at = perf_counter()
 
-        for event in rag.answer_from_hits_stream(question, hits, analysis=analysis):
+        analysis = QueryAnalysis(
+            original_question=question,
+            rewritten_query=retrieval_analysis.rewritten_query,
+            intent=retrieval_analysis.intent,
+            section_types=retrieval_analysis.section_types,
+        )
+
+        for event in rag.answer_from_hits_stream(
+            question,
+            hits,
+            analysis=analysis,
+            resolved_question=resolved_question if retrieval_question else None,
+        ):
             if event["event"] in {"meta", "done"}:
                 event["data"]["retrieval_timings_ms"] = timings
                 event["data"]["top_k"] = resolved_top_k
@@ -202,9 +220,15 @@ class PaperService:
             yield event
 
     @staticmethod
-    def _resolve_top_k(paper_id: str | None, top_k: int | None) -> int:
+    def _resolve_top_k(
+        paper_id: str | None,
+        top_k: int | None,
+        question: str | None = None,
+    ) -> int:
         if top_k is not None:
             return top_k
+        if paper_id and question and is_long_form_question(question):
+            return max(settings.qa_detailed_top_k, settings.retrieval_top_k)
         return settings.retrieval_top_k if paper_id else settings.multi_paper_top_k
 
     def summarize(self, paper_id: str, *, top_k: int = 12) -> dict[str, Any]:
@@ -231,20 +255,57 @@ class _SessionEntry:
 class AgentSessionStore:
     """Process-local Agent memories isolated by an API session id."""
 
-    def __init__(self) -> None:
+    def __init__(self, conversation_store: ConversationStore | None = None) -> None:
         self._entries: dict[str, _SessionEntry] = {}
         self._lock = RLock()
+        self.conversation_store = conversation_store
 
     @contextmanager
     def session(self, session_id: str) -> Iterator[AgentMemory]:
         with self._lock:
-            entry = self._entries.setdefault(session_id, _SessionEntry())
+            entry = self._entries.get(session_id)
+            if entry is None:
+                memory = (
+                    self.conversation_store.load_memory(session_id)
+                    if self.conversation_store is not None
+                    else AgentMemory()
+                )
+                entry = _SessionEntry(memory=memory)
+                self._entries[session_id] = entry
         with entry.lock:
-            yield entry.memory
+            try:
+                yield entry.memory
+            finally:
+                if self.conversation_store is not None:
+                    self.conversation_store.save_memory(session_id, entry.memory)
+
+    def persist_exchange(
+        self,
+        session_id: str,
+        *,
+        user_content: str,
+        assistant_content: str,
+        intent: str,
+        memory: AgentMemory,
+    ) -> None:
+        if self.conversation_store is None:
+            return
+        self.conversation_store.save_exchange(
+            session_id,
+            user_content=user_content,
+            assistant_content=assistant_content,
+            memory=memory,
+            intent=intent,
+            rewritten_query=memory.state.rewritten_query,
+        )
 
     def clear(self, session_id: str) -> bool:
         with self._lock:
-            return self._entries.pop(session_id, None) is not None
+            removed = self._entries.pop(session_id, None) is not None
+        if self.conversation_store is not None and self.conversation_store.conversation_exists(session_id):
+            self.conversation_store.delete_conversation(session_id)
+            removed = True
+        return removed
 
 
 @dataclass

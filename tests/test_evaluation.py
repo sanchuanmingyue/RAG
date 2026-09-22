@@ -15,6 +15,7 @@ from backend.evaluation import (
     _extract_polarity,
     _split_answer_claims,
     build_open_rag_bench_chunks,
+    index_chunks_in_batches,
     load_open_rag_bench_cases,
     _parse_judge_output,
     _structured_targets,
@@ -24,6 +25,7 @@ from backend.evaluation import (
     score_answer_correctness,
     summarize_records,
 )
+from backend.text_splitter import TextChunk
 from backend.rag_chain import (
     PaperRAG,
     _diversify_hits_by_paper,
@@ -31,11 +33,44 @@ from backend.rag_chain import (
     classify_refusal_answer,
     extract_source_citation_ids,
     is_refusal_answer,
+    is_vacuous_answer,
 )
-from backend.prompts import build_qa_messages, is_multi_paper_question, is_yes_no_question
+from backend.prompts import (
+    build_compare_messages,
+    build_qa_messages,
+    is_long_form_question,
+    is_multi_paper_question,
+    is_yes_no_question,
+)
 
 
 class EvaluationMetricsTests(unittest.TestCase):
+    def test_batch_indexing_resumes_and_skips_existing_chunk_ids(self) -> None:
+        chunks = [
+            TextChunk("c1", "p1", "paper.pdf", 1, "one"),
+            TextChunk("c2", "p1", "paper.pdf", 1, "two"),
+        ]
+
+        class FakeCollection:
+            def get(self, *, ids, include):
+                return {"ids": [value for value in ids if value == "c1"]}
+
+        class FakeStore:
+            collection = FakeCollection()
+
+            def __init__(self) -> None:
+                self.indexed = []
+
+            def index_chunks(self, values, embedding_client):
+                self.indexed.extend(chunk.chunk_id for chunk in values)
+                return len(values)
+
+        store = FakeStore()
+        total = index_chunks_in_batches(store, chunks, object(), batch_size=2)
+
+        self.assertEqual(total, 2)
+        self.assertEqual(store.indexed, ["c2"])
+
     def test_research_background_searches_intro_abstract_and_related_work(self) -> None:
         analysis = analyze_question("请总结多篇论文的研究背景")
 
@@ -57,6 +92,18 @@ class EvaluationMetricsTests(unittest.TestCase):
 
     def test_multi_paper_pronoun_question_is_detected(self) -> None:
         self.assertTrue(is_multi_paper_question("他们分别采用什么方法？"))
+
+    def test_detailed_and_multi_paper_questions_use_long_form(self) -> None:
+        self.assertTrue(is_long_form_question("详细解释这篇论文为什么采用双时间尺度设计"))
+        self.assertTrue(is_long_form_question("这些论文分别在做什么？"))
+        self.assertFalse(is_long_form_question("核心方法是什么？"))
+
+    def test_compare_prompt_requests_mechanism_level_synthesis(self) -> None:
+        prompt = build_compare_messages(["paper A", "paper B"])[1]["content"]
+
+        self.assertIn("逐篇解析", prompt)
+        self.assertIn("横向对比矩阵", prompt)
+        self.assertIn("为什么方法不同", prompt)
 
     def test_multi_paper_hits_are_balanced_across_documents(self) -> None:
         hits = [
@@ -85,6 +132,20 @@ class EvaluationMetricsTests(unittest.TestCase):
         self.assertIn("这是一个 Yes/No", chinese_binary_prompt)
         self.assertIn("严格使用中文", chinese_binary_prompt)
         self.assertNotIn("This is a Yes/No", open_prompt)
+
+    def test_open_experiment_prompt_requires_concrete_content(self) -> None:
+        hits = [{"text": "Experiments improve the cache hit rate by 41.06%.", "metadata": {}}]
+
+        prompt = build_qa_messages("详细介绍当前文章的实验部分", hits)[1]["content"]
+
+        self.assertIn("开放式内容问题", prompt)
+        self.assertIn("实验环境或参数", prompt)
+        self.assertIn("不能只说实验有效或存在证据", prompt)
+
+    def test_vacuous_evidence_statement_is_detected(self) -> None:
+        self.assertTrue(is_vacuous_answer("是，论文中有明确依据 [S1]。"))
+        self.assertTrue(is_vacuous_answer("The sources provide evidence [S1]."))
+        self.assertFalse(is_vacuous_answer("缓存命中率至少提升 41.06% [S1]。"))
 
     def test_chinese_negative_polarity_after_subject_is_detected(self) -> None:
         record = EvaluationRecord(
@@ -345,6 +406,182 @@ class EvaluationMetricsTests(unittest.TestCase):
         self.assertTrue(result["citation_retry_attempted"])
         self.assertIsNone(result["refusal_reason"])
         self.assertEqual(result["answer"], "The method uses graph reinforcement learning [S1].")
+
+    def test_vacuous_answer_gets_content_retry(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def chat(self, messages, temperature=0.2):
+                self.calls += 1
+                if self.calls == 1:
+                    return "是，论文中有明确依据 [S1]。"
+                return "实验表明，该方法将缓存命中率至少提升了 41.06% [S1]。"
+
+        client = FakeClient()
+        result = PaperRAG(object(), client).answer_from_hits(  # type: ignore[arg-type]
+            "这篇论文的主要实验结论是什么？",
+            [{"text": "Experimental results improve the cache hit rate by at least 41.06%.", "metadata": {}}],
+        )
+
+        self.assertEqual(client.calls, 2)
+        self.assertTrue(result["answer_quality_retry_attempted"])
+        self.assertEqual(result["answer_quality_retry_reason"], "vacuous_answer")
+        self.assertIn("41.06%", result["answer"])
+        self.assertFalse(result["answer"].startswith("是，"))
+        self.assertIsNone(result["refusal_reason"])
+
+    def test_premature_experiment_refusal_gets_evidence_retry(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def chat(self, messages, temperature=0.2):
+                self.calls += 1
+                if self.calls == 1:
+                    return "论文中没有找到明确依据。"
+                return "实验在服务器环境中进行，并比较了缓存命中率和服务成本 [S1]。"
+
+        client = FakeClient()
+        result = PaperRAG(object(), client).answer_from_hits(  # type: ignore[arg-type]
+            "详细介绍当前文章的实验部分",
+            [
+                {
+                    "text": "Experimental evaluation on a server compares the cache hit rate and service cost.",
+                    "metadata": {"section_type": "method"},
+                }
+            ],
+        )
+
+        self.assertEqual(client.calls, 2)
+        self.assertTrue(result["answer_quality_retry_attempted"])
+        self.assertEqual(result["answer_quality_retry_reason"], "premature_refusal")
+        self.assertIsNone(result["refusal_reason"])
+
+    def test_premature_background_refusal_retries_when_intro_was_retrieved(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def chat(self, messages, temperature=0.2):
+                self.calls += 1
+                if self.calls == 1:
+                    return "论文中没有找到明确依据。"
+                return "大模型推理资源需求高，边缘负载与云端扩缩容相互影响 [S1]。"
+
+        client = FakeClient()
+        result = PaperRAG(object(), client).answer_from_hits(  # type: ignore[arg-type]
+            "介绍文章的研究背景",
+            [
+                {
+                    "text": "LLM services require more resources, and inference latency grows nonlinearly.",
+                    "metadata": {"section_type": "introduction"},
+                }
+            ],
+        )
+
+        self.assertEqual(client.calls, 2)
+        self.assertTrue(result["answer_quality_retry_attempted"])
+        self.assertEqual(result["answer_quality_retry_reason"], "premature_refusal")
+        self.assertIsNone(result["refusal_reason"])
+
+    def test_long_form_qa_builds_private_evidence_plan_and_uses_large_budget(self) -> None:
+        class FakeConfig:
+            qa_planning_enabled = True
+            qa_plan_max_tokens = 77
+            qa_long_max_tokens = 333
+            qa_max_tokens = 50
+            qa_auto_continue = False
+
+        class FakeClient:
+            config = FakeConfig()
+            last_chat_metadata = {"finish_reason": "stop"}
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def chat(self, messages, temperature=0.2, max_tokens=None):
+                self.calls.append({"messages": messages, "max_tokens": max_tokens})
+                if len(self.calls) == 1:
+                    return "方法动机与机制 [S1]"
+                return "该方法通过双时间尺度分离缓存与资源分配，以匹配两类状态的变化速度 [S1]。"
+
+        client = FakeClient()
+        result = PaperRAG(object(), client).answer_from_hits(  # type: ignore[arg-type]
+            "详细解释这篇论文为什么采用双时间尺度设计",
+            [{"text": "Caching changes slowly while channels change quickly.", "metadata": {}}],
+        )
+
+        self.assertEqual([call["max_tokens"] for call in client.calls], [77, 333])
+        self.assertTrue(result["long_form"])
+        self.assertTrue(result["evidence_plan_used"])
+        self.assertEqual(result["max_output_tokens"], 333)
+
+    def test_long_form_qa_continues_once_after_length_finish(self) -> None:
+        class FakeConfig:
+            qa_planning_enabled = False
+            qa_long_max_tokens = 200
+            qa_max_tokens = 50
+            qa_auto_continue = True
+
+        class FakeClient:
+            config = FakeConfig()
+
+            def __init__(self) -> None:
+                self.calls = 0
+                self.last_chat_metadata = {}
+
+            def chat(self, messages, temperature=0.2, max_tokens=None):
+                self.calls += 1
+                if self.calls == 1:
+                    self.last_chat_metadata = {"finish_reason": "length"}
+                    return "第一部分介绍系统模型 [S1]。"
+                self.last_chat_metadata = {"finish_reason": "stop"}
+                return "第二部分补充实验验证 [S1]。"
+
+        client = FakeClient()
+        result = PaperRAG(object(), client).answer_from_hits(  # type: ignore[arg-type]
+            "详细介绍全文",
+            [{"text": "System model and experiments.", "metadata": {}}],
+        )
+
+        self.assertEqual(client.calls, 2)
+        self.assertTrue(result["continuation_attempted"])
+        self.assertIn("第一部分", result["answer"])
+        self.assertIn("第二部分", result["answer"])
+
+    def test_detailed_question_retrieves_multiple_evidence_facets(self) -> None:
+        class FakeStore:
+            def __init__(self) -> None:
+                self.queries = []
+                self.last_query_timings_ms = {}
+
+            def query(self, **kwargs):
+                query = kwargs["query_text"]
+                self.queries.append(query)
+                index = len(self.queries)
+                self.last_query_timings_ms = {"total_ms": 1.0}
+                return [
+                    {
+                        "text": f"evidence {index}",
+                        "metadata": {
+                            "paper_id": "p1",
+                            "parent_id": f"section-{index}",
+                            "section_type": "method",
+                        },
+                    }
+                ]
+
+        store = FakeStore()
+        hits, _analysis = PaperRAG(store, object()).retrieve_hits(  # type: ignore[arg-type]
+            "请逐章详细介绍全文的背景、方法和实验",
+            paper_id="p1",
+            top_k=12,
+        )
+
+        self.assertGreaterEqual(len(store.queries), 5)
+        self.assertGreaterEqual(len(hits), 5)
+        self.assertIn("逐章详细介绍", store.queries[-1])
 
     def test_suspicious_binary_comparison_gets_one_consistency_retry(self) -> None:
         class FakeClient:

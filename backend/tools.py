@@ -12,7 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from backend.embeddings import OpenAICompatibleClient
-from backend.corpus_analysis import CorpusAnalysisService, format_corpus_classification
+from backend.arxiv_mcp import ArxivSearchService, format_arxiv_search_answer
+from backend.corpus_analysis import (
+    CorpusAnalysisService,
+    format_corpus_classification,
+    requested_category_count,
+)
+from backend.conversation import FollowUpResolution
 from backend.exporter import Exporter
 from backend.ieee_search import LiteratureSearchService, format_search_answer
 from backend.paper_compare import compare_paper_cards
@@ -32,9 +38,19 @@ class PaperQATool:
     def __init__(self, vector_store: ChromaVectorStore, llm_client: OpenAICompatibleClient) -> None:
         self.rag = PaperRAG(vector_store, llm_client)
 
-    def run(self, question: str, paper_id: str | None = None) -> AgentResult:
+    def run(
+        self,
+        question: str,
+        paper_id: str | None = None,
+        *,
+        retrieval_question: str | None = None,
+    ) -> AgentResult:
         # paper_id 为空时表示在全部论文范围检索；不为空时只检索指定论文。
-        result = self.rag.answer(question, paper_id=paper_id)
+        result = self.rag.answer(
+            question,
+            paper_id=paper_id,
+            retrieval_question=retrieval_question,
+        )
         return AgentResult(answer=result["answer"], intent="qa", sources=result["sources"])
 
 
@@ -186,16 +202,125 @@ class LiteratureSearchTool:
         )
 
 
+class ArxivSearchTool:
+    """Expose arXiv discovery through a real MCP stdio tool call."""
+
+    def __init__(self, search_service: ArxivSearchService) -> None:
+        self.search_service = search_service
+
+    def run(self, request: str) -> AgentResult:
+        payload = self.search_service.search(request)
+        lines = [format_arxiv_search_answer(payload)]
+        for item in payload.get("results") or []:
+            title = item.get("title") or "未命名论文"
+            url = item.get("arxiv_url") or item.get("pdf_url") or ""
+            title_text = f"[{title}]({url})" if url else title
+            authors = ", ".join((item.get("authors") or [])[:4]) or "作者信息未返回"
+            categories = ", ".join((item.get("categories") or [])[:4]) or "未分类"
+            lines.append(
+                f"{item.get('rank')}. **{title_text}**\n"
+                f"   - {authors} · {item.get('year') or '年份未知'} · {categories}\n"
+                f"   - arXiv：`{item.get('arxiv_id') or '未知'}`"
+            )
+        return AgentResult(
+            answer="\n\n".join(lines),
+            intent="literature_search",
+            artifacts={"search": payload, "provider": "arxiv_mcp"},
+        )
+
+
 class CorpusClassificationTool:
     """Classify the complete paper library by background-section semantics."""
 
     def __init__(self, vector_store: ChromaVectorStore, llm_client: OpenAICompatibleClient) -> None:
         self.service = CorpusAnalysisService(vector_store, llm_client)
 
-    def run(self, request: str) -> AgentResult:
-        payload = self.service.classify_by_background(request)
+    def run(
+        self,
+        request: str,
+        *,
+        previous_artifact: dict[str, Any] | None = None,
+        resolution: FollowUpResolution | None = None,
+    ) -> AgentResult:
+        previous = previous_artifact or {}
+        operation = resolution.operation if resolution else None
+
+        if operation == "list_category":
+            category = self._category(previous, resolution.target_category)
+            if category is None:
+                return AgentResult(
+                    answer="上一轮分类结果中没有找到这个类别，请先确认类别编号。",
+                    intent="corpus_analysis",
+                    artifacts={"corpus_analysis": previous} if previous else {},
+                )
+            papers = category.get("papers") or []
+            answer = (
+                f"### 第 {category.get('rank')} 类：{category.get('label')}（{len(papers)} 篇）\n\n"
+                + "\n".join(f"- `{paper.get('file_name')}`" for paper in papers)
+            )
+            return AgentResult(
+                answer=answer,
+                intent="corpus_analysis",
+                artifacts={"corpus_analysis": previous},
+            )
+
+        if operation == "explain_classification" and previous:
+            lines = [
+                f"本轮采用 `{previous.get('method')}`，共处理 {previous.get('paper_count')} 篇论文。"
+            ]
+            if previous.get("silhouette_score") is not None:
+                lines.append(f"聚类轮廓系数为 `{previous['silhouette_score']}`。")
+            for category in previous.get("categories") or []:
+                keywords = "、".join(category.get("keywords") or []) or "未提取到稳定关键词"
+                representatives = "、".join(category.get("representative_papers") or [])
+                lines.append(
+                    f"- **第 {category.get('rank')} 类 {category.get('label')}**："
+                    f"关键词为 {keywords}；代表论文为 {representatives}。"
+                )
+            return AgentResult(
+                answer="\n\n".join(lines),
+                intent="corpus_analysis",
+                artifacts={"corpus_analysis": previous},
+            )
+
+        if operation == "subdivide_category":
+            category = self._category(previous, resolution.target_category)
+            if category is None:
+                raise ValueError("上一轮分类结果中没有找到需要细分的类别。")
+            paper_ids = {str(item.get("paper_id")) for item in category.get("papers") or [] if item.get("paper_id")}
+            if len(paper_ids) < 3:
+                raise ValueError("该类别少于 3 篇论文，无法继续进行有意义的语义细分。")
+            forced_count = requested_category_count(request) or min(3, len(paper_ids) - 1)
+            payload = self.service.classify_by_background(
+                request,
+                paper_ids=paper_ids,
+                category_count=forced_count,
+            )
+            payload["parent_category"] = {
+                "rank": category.get("rank"),
+                "label": category.get("label"),
+                "source_artifact_id": previous.get("artifact_id"),
+            }
+        elif operation == "refine_classification" and previous:
+            old_count = int(previous.get("category_count") or 3)
+            paper_count = int(previous.get("paper_count") or 0)
+            forced_count = requested_category_count(request) or min(max(old_count + 2, old_count * 2), 12)
+            forced_count = min(forced_count, max(paper_count - 1, 2))
+            payload = self.service.classify_by_background(request, category_count=forced_count)
+            payload["refined_from_artifact_id"] = previous.get("artifact_id")
+        else:
+            payload = self.service.classify_by_background(request)
         return AgentResult(
             answer=format_corpus_classification(payload),
             intent="corpus_analysis",
             artifacts={"corpus_analysis": payload},
+        )
+
+    @staticmethod
+    def _category(payload: dict[str, Any], rank: int | None) -> dict[str, Any] | None:
+        if rank is None:
+            return None
+        return next(
+            (item for item in payload.get("categories") or [] if int(item.get("rank") or 0) == rank),
+            None,
         )

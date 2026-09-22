@@ -64,7 +64,21 @@ class AgentIntentTests(unittest.TestCase):
         self.assertEqual(router.route("当前库中有多少篇文章"), "library_status")
         self.assertEqual(router.route("列出知识库里已索引的文件"), "library_status")
         self.assertTrue(is_library_status_query("向量库现在有多少 chunks"))
+        self.assertEqual(router.route("List the files in the current collection"), "library_status")
+
+    def test_routes_english_summary_and_corpus_analysis(self) -> None:
+        router = AgentRouter()
+        self.assertEqual(router.route("Summarize the main contribution of this paper"), "summary")
+        self.assertEqual(
+            router.route("Cluster all papers in the library by research topic"),
+            "corpus_analysis",
+        )
         self.assertEqual(router.route("这篇论文有多少组实验？"), "qa")
+
+    def test_routes_multi_paper_explanation_to_comparison_pipeline(self) -> None:
+        router = AgentRouter()
+        self.assertEqual(router.route("这些文章分别在做什么"), "compare")
+        self.assertEqual(router.route("这几篇论文各自的方法和实验是什么"), "compare")
 
     def test_routes_external_literature_search(self) -> None:
         self.assertEqual(

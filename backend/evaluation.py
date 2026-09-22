@@ -53,6 +53,9 @@ class EvaluationConfig:
     corpus_document_count: int = 0
     embedding_model: str = ""
     collection_name: str = ""
+    chunk_strategy: str = "section_paragraph"
+    chunk_size: int = 0
+    chunk_overlap: int = 0
     two_stage_retrieval: bool = True
     document_candidate_k: int = 50
     document_top_k: int = 5
@@ -318,7 +321,10 @@ def build_open_rag_bench_chunks(
             section_id = str(section_index if raw_section_id is None else raw_section_id)
             section_title, section_path, section_type = _markdown_section_metadata(text, section_id)
             parent_id = f"orb_{prefix}_section_{_safe_chunk_prefix(section_id)}"
-            for child_index, child_text in enumerate(split_text(text, chunk_size, chunk_overlap), start=1):
+            for child_index, child_text in enumerate(
+                split_text(text, chunk_size, chunk_overlap),
+                start=1,
+            ):
                 chunks.append(
                     TextChunk(
                         chunk_id=f"{parent_id}_chunk_{child_index}",
@@ -381,13 +387,23 @@ def index_chunks_in_batches(
     embedding_client: OpenAICompatibleClient,
     *,
     batch_size: int = 200,
+    resume: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> int:
-    """Index in bounded batches to limit memory usage and make progress visible."""
+    """Index in bounded batches and resume safely after an interrupted run."""
 
     indexed = 0
     for start in range(0, len(chunks), batch_size):
-        indexed += vector_store.index_chunks(chunks[start : start + batch_size], embedding_client)
+        batch = chunks[start : start + batch_size]
+        existing_ids: set[str] = set()
+        collection = getattr(vector_store, "collection", None)
+        if resume and collection is not None:
+            existing = collection.get(ids=[chunk.chunk_id for chunk in batch], include=[])
+            existing_ids = {str(value) for value in existing.get("ids", [])}
+        missing = [chunk for chunk in batch if chunk.chunk_id not in existing_ids]
+        if missing:
+            vector_store.index_chunks(missing, embedding_client)
+        indexed += len(batch)
         if progress_callback is not None:
             progress_callback(indexed, len(chunks))
     return indexed

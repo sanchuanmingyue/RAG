@@ -15,7 +15,7 @@ import chromadb
 from backend.config import VECTOR_DB_DIR, settings
 from backend.embeddings import OpenAICompatibleClient
 from backend.reranker import SectionReranker
-from backend.text_splitter import TextChunk
+from backend.text_splitter import SPLITTER_VERSION, TextChunk
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+", re.UNICODE)
@@ -474,10 +474,17 @@ class ChromaVectorStore:
             parent_text = "\n".join(row.get("text", "") for row in rows if row.get("text"))
             parent_pages = sorted(
                 {
-                    str(row.get("metadata", {}).get("page", ""))
+                    page
                     for row in rows
-                    if row.get("metadata", {}).get("page", "") != ""
-                }
+                    for page in re.findall(
+                        r"\d+",
+                        str(
+                            row.get("metadata", {}).get("page_numbers")
+                            or row.get("metadata", {}).get("page", "")
+                        ),
+                    )
+                },
+                key=int,
             )
             parent_hit = dict(hit)
             parent_hit["text"] = parent_text or hit.get("text", "")
@@ -509,9 +516,22 @@ class ChromaVectorStore:
                     "paper_id": paper_id,
                     "file_name": metadata.get("file_name", ""),
                     "chunk_count": 0,
+                    "_splitter_versions": set(),
                 },
             )
             papers[paper_id]["chunk_count"] += 1
+
+            version = str(metadata.get("splitter_version") or "legacy")
+            papers[paper_id]["_splitter_versions"].add(version)
+
+        for paper in papers.values():
+            versions = paper.pop("_splitter_versions")
+            paper["splitter_version"] = (
+                SPLITTER_VERSION
+                if versions == {SPLITTER_VERSION}
+                else ", ".join(sorted(versions))
+            )
+            paper["index_outdated"] = versions != {SPLITTER_VERSION}
 
         self._paper_list_cache = sorted(papers.values(), key=lambda item: item["file_name"])
         return [dict(item) for item in self._paper_list_cache]

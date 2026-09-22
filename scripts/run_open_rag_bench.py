@@ -118,29 +118,70 @@ def main() -> None:
 
     vector_store = ChromaVectorStore(collection_name=args.collection)
     client = OpenAICompatibleClient()
-    if args.rebuild or vector_store.count_chunks() == 0:
-        if args.rebuild:
-            vector_store.reset_collection()
-        print("正在读取 benchmark corpus 并切分文本...", flush=True)
-        chunks = build_open_rag_bench_chunks(
-            args.dataset_root,
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap,
-            include_tables=args.include_tables,
-            document_ids=document_ids,
+    if args.rebuild:
+        vector_store.reset_collection()
+    print("正在读取 benchmark corpus 并切分文本...", flush=True)
+    chunks = build_open_rag_bench_chunks(
+        args.dataset_root,
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
+        include_tables=args.include_tables,
+        document_ids=document_ids,
+    )
+    expected_ids = {chunk.chunk_id for chunk in chunks}
+    expected_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+    existing_payload = vector_store.collection.get(include=["documents", "metadatas"])
+    existing_ids = {str(value) for value in existing_payload.get("ids", [])}
+    unexpected_ids = existing_ids - expected_ids
+    existing_rows = {
+        str(row_id): (str(document or ""), dict(metadata or {}))
+        for row_id, document, metadata in zip(
+            existing_payload.get("ids", []),
+            existing_payload.get("documents") or [],
+            existing_payload.get("metadatas") or [],
         )
+    }
+    mismatched_ids = {
+        row_id
+        for row_id, (document, metadata) in existing_rows.items()
+        if row_id in expected_by_id
+        and (
+            document != expected_by_id[row_id].text
+            or metadata.get("section_path", "") != expected_by_id[row_id].section_path
+            or metadata.get("file_name", "") != expected_by_id[row_id].file_name
+        )
+    }
+    if unexpected_ids or mismatched_ids:
+        raise SystemExit(
+            f"collection={args.collection} 与当前段落感知切分不一致："
+            f"多余 {len(unexpected_ids)} 个、内容不匹配 {len(mismatched_ids)} 个 chunk。"
+            "请更换 --collection，或添加 --rebuild 后重试。"
+        )
+    missing_count = len(expected_ids - existing_ids)
+    if missing_count:
         print(f"正在生成 embedding 并写入 Chroma（共 {len(chunks)} chunks）...", flush=True)
+        if existing_ids:
+            print(
+                f"检测到上次已完成 {len(existing_ids)} chunks，本次从剩余 {missing_count} chunks 继续。",
+                flush=True,
+            )
 
         def show_index_progress(indexed: int, total: int) -> None:
             print(f"  索引进度：{indexed}/{total} chunks", flush=True)
 
-        indexed = index_chunks_in_batches(vector_store, chunks, client, progress_callback=show_index_progress)
+        indexed = index_chunks_in_batches(
+            vector_store,
+            chunks,
+            client,
+            resume=True,
+            progress_callback=show_index_progress,
+        )
         print(
             f"已建立 benchmark 索引：{indexed} chunks，{len(document_ids)} 篇文档，collection={args.collection}",
             flush=True,
         )
     else:
-        print(f"复用已有 benchmark 索引：{vector_store.count_chunks()} chunks，collection={args.collection}", flush=True)
+        print(f"复用完整 benchmark 索引：{len(existing_ids)} chunks，collection={args.collection}", flush=True)
 
     if settings.enable_startup_warmup:
         print("正在预热关键词索引和章节重排器...", flush=True)
@@ -155,6 +196,9 @@ def main() -> None:
         corpus_document_count=len(document_ids),
         embedding_model=settings.embedding_model,
         collection_name=args.collection,
+        chunk_strategy="section_paragraph",
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
         two_stage_retrieval=settings.enable_two_stage_retrieval,
         document_candidate_k=settings.document_candidate_k,
         document_top_k=settings.document_top_k,

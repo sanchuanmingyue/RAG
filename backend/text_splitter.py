@@ -7,6 +7,12 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
+# Persisted with every chunk so an existing library can be migrated whenever
+# section recognition or chunk construction changes. Bump this value for any
+# indexing change that requires old PDFs to be split again.
+SPLITTER_VERSION = "section-aware-v2"
+
+
 @dataclass
 class TextChunk:
     chunk_id: str
@@ -14,6 +20,9 @@ class TextChunk:
     file_name: str
     page: int
     text: str
+    page_start: int = 0
+    page_end: int = 0
+    page_numbers: str = ""
     section_title: str = ""
     subsection_title: str = ""
     section_type: str = ""
@@ -30,6 +39,9 @@ class TextChunk:
             "paper_id": self.paper_id,
             "file_name": self.file_name,
             "page": self.page,
+            "page_start": self.page_start or self.page,
+            "page_end": self.page_end or self.page,
+            "page_numbers": self.page_numbers or str(self.page),
             "chunk_id": self.chunk_id,
             "section_title": self.section_title,
             "subsection_title": self.subsection_title,
@@ -40,6 +52,7 @@ class TextChunk:
             "child_index": self.child_index,
             "benchmark_doc_id": self.benchmark_doc_id,
             "benchmark_section_id": self.benchmark_section_id,
+            "splitter_version": SPLITTER_VERSION,
         }
 
     def to_embedding_text(self, include_section_context: bool = True) -> str:
@@ -69,28 +82,93 @@ class TextChunk:
         return asdict(self)
 
 
-def split_text(text: str, chunk_size: int = 800, chunk_overlap: int = 120) -> list[str]:
-    """Split text with the existing sliding-window strategy."""
+def _validate_chunk_settings(chunk_size: int, chunk_overlap: int) -> None:
 
     if chunk_size <= 0:
         raise ValueError("chunk_size must be greater than 0")
     if chunk_overlap < 0 or chunk_overlap >= chunk_size:
         raise ValueError("chunk_overlap must be >= 0 and smaller than chunk_size")
 
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[。！？!?；;])\s+|(?<=[.])\s+(?=[A-Z0-9])")
+
+
+def _preferred_boundary(text: str, start: int, hard_end: int, chunk_size: int) -> int:
+    """Choose the latest paragraph, line, or sentence boundary near ``hard_end``."""
+
+    if hard_end >= len(text):
+        return len(text)
+    # A 40% lower bound avoids cutting a sentence merely to fill the window;
+    # the following overlap still keeps neighboring context connected.
+    minimum = min(start + max(int(chunk_size * 0.40), 1), hard_end)
+    window = text[minimum:hard_end]
+    candidates: list[int] = []
+    for pattern in (r"\n\s*\n", r"\n", _SENTENCE_BOUNDARY):
+        matches = list(re.finditer(pattern, window)) if isinstance(pattern, str) else list(pattern.finditer(window))
+        if matches:
+            candidates.append(minimum + matches[-1].end())
+            break
+    if candidates:
+        return candidates[-1]
+
+    # Fall back to a word boundary before using a hard character cut.
+    spaces = list(re.finditer(r"\s+", window))
+    return minimum + spaces[-1].end() if spaces else hard_end
+
+
+def _paragraph_spans(text: str, chunk_size: int, chunk_overlap: int) -> list[tuple[str, int, int]]:
+    """Create bounded windows while preferring semantic text boundaries."""
+
     cleaned = text.strip()
     if not cleaned:
         return []
 
-    chunks: list[str] = []
+    chunks: list[tuple[str, int, int]] = []
     start = 0
     while start < len(cleaned):
-        end = min(start + chunk_size, len(cleaned))
-        chunks.append(cleaned[start:end].strip())
-        if end == len(cleaned):
+        hard_end = min(start + chunk_size, len(cleaned))
+        end = _preferred_boundary(cleaned, start, hard_end, chunk_size)
+        if end <= start:
+            end = hard_end
+        chunk = cleaned[start:end].strip()
+        if chunk:
+            chunks.append((chunk, start, end))
+        if end >= len(cleaned):
             break
-        start = end - chunk_overlap
 
-    return [chunk for chunk in chunks if chunk]
+        next_start = max(end - chunk_overlap, start + 1)
+        # Avoid beginning a child in the middle of a word when a nearby
+        # whitespace boundary is available. Sentence/paragraph context remains
+        # present because only the overlap edge is adjusted.
+        nearby = re.search(r"\s+", cleaned[next_start : min(end, next_start + 80)])
+        if nearby:
+            next_start += nearby.end()
+        start = next_start
+    return chunks
+
+
+def split_text_with_spans(
+    text: str,
+    chunk_size: int = 800,
+    chunk_overlap: int = 120,
+) -> list[tuple[str, int, int]]:
+    """Split at paragraph/sentence boundaries and retain source offsets."""
+
+    _validate_chunk_settings(chunk_size, chunk_overlap)
+    return _paragraph_spans(text, chunk_size, chunk_overlap)
+
+
+def split_text(
+    text: str,
+    chunk_size: int = 800,
+    chunk_overlap: int = 120,
+) -> list[str]:
+    """Split text with paragraph/sentence-aware bounded windows."""
+
+    return [chunk for chunk, _start, _end in split_text_with_spans(
+        text,
+        chunk_size,
+        chunk_overlap,
+    )]
 
 
 SECTION_PATTERNS: list[tuple[str, str, tuple[str, ...]]] = [
@@ -131,8 +209,13 @@ SECTION_PATTERNS: list[tuple[str, str, tuple[str, ...]]] = [
         (
             "experiment",
             "experiments",
+            "experimental simulation and evaluation",
+            "experimental evaluation",
             "experimental setup",
             "experimental settings",
+            "environment settings",
+            "performance evaluation",
+            "simulation and evaluation",
             "evaluation",
             "empirical evaluation",
             "implementation details",
@@ -238,8 +321,15 @@ def _match_section_heading(line: str) -> dict[str, Any] | None:
         flags=re.I,
     )
     lowered = unnumbered.lower()
+    has_explicit_section_number = bool(
+        re.match(r"^\s*(?:section\s+)?\d+(?:\.\d+)*[\).\s:-]+", stripped, flags=re.I)
+    )
     for phrase, section_type, title in _PREFIX_HEADINGS:
         prefix = f"{phrase} "
+        if phrase in {"algorithm", "model", "framework"} and not has_explicit_section_number:
+            # Avoid interpreting captions such as "Algorithm 1 ..." or prose
+            # beginning with "Model ..." as a new top-level section.
+            continue
         if lowered.startswith(prefix) and len(unnumbered) > len(prefix) + 20:
             remainder = unnumbered[len(prefix) :].strip()
             return {
@@ -338,36 +428,85 @@ def split_pages(
     chunk_size: int = 800,
     chunk_overlap: int = 120,
 ) -> list[TextChunk]:
-    """Split PDF page text into chunks while preserving section metadata."""
+    """Build cross-page section parents and paragraph-aware child chunks.
+
+    Contiguous blocks that share a section are joined before splitting, and
+    every child is attributed to its exact start/end page range.
+    """
 
     all_chunks: list[TextChunk] = []
     current_section = _empty_section()
-    parent_index = 1
+    section_parents: list[dict[str, Any]] = []
     for page in pages:
         section_blocks, current_section = _split_page_into_section_blocks(page["text"], current_section)
-        chunk_index = 1
         for block_text, section in section_blocks:
-            parent_id = f"{page['paper_id']}_parent_{parent_index}"
-            page_chunks = split_text(block_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-            for child_index, chunk_text in enumerate(page_chunks, start=1):
-                chunk_id = f"{page['paper_id']}_page_{page['page']}_chunk_{chunk_index}"
-                all_chunks.append(
-                    TextChunk(
-                        chunk_id=chunk_id,
-                        paper_id=page["paper_id"],
-                        file_name=page["file_name"],
-                        page=int(page["page"]),
-                        text=chunk_text,
-                        section_title=section.get("section_title", ""),
-                        subsection_title=section.get("subsection_title", ""),
-                        section_type=section.get("section_type", ""),
-                        section_path=section.get("section_path", ""),
-                        parent_id=parent_id,
-                        parent_index=parent_index,
-                        child_index=child_index,
-                    )
+            section_path = section.get("section_path", "")
+            section_type = section.get("section_type", "")
+            identity = (
+                section_path,
+                section_type,
+                "" if section_path or section_type else f"page:{page['page']}",
+            )
+            if not section_parents or section_parents[-1]["identity"] != identity:
+                section_parents.append(
+                    {
+                        "identity": identity,
+                        "section": dict(section),
+                        "parts": [],
+                        "paper_id": page["paper_id"],
+                        "file_name": page["file_name"],
+                    }
                 )
-                chunk_index += 1
-            parent_index += 1
+            section_parents[-1]["parts"].append((int(page["page"]), block_text.strip()))
+
+    for parent_index, parent in enumerate(section_parents, start=1):
+        combined_parts: list[str] = []
+        page_ranges: list[tuple[int, int, int]] = []
+        cursor = 0
+        for page_number, part_text in parent["parts"]:
+            if combined_parts:
+                cursor += 2
+            start = cursor
+            combined_parts.append(part_text)
+            cursor += len(part_text)
+            page_ranges.append((start, cursor, page_number))
+        combined_text = "\n\n".join(combined_parts)
+        parent_id = f"{parent['paper_id']}_section_{parent_index}"
+        child_spans = split_text_with_spans(
+            combined_text,
+            chunk_size,
+            chunk_overlap,
+        )
+        section = parent["section"]
+        for child_index, (chunk_text, start, end) in enumerate(child_spans, start=1):
+            page_numbers = list(
+                dict.fromkeys(
+                    page_number
+                    for page_start, page_end, page_number in page_ranges
+                    if page_start < end and page_end > start
+                )
+            )
+            if not page_numbers:
+                page_numbers = [parent["parts"][0][0]]
+            first_page, last_page = min(page_numbers), max(page_numbers)
+            all_chunks.append(
+                TextChunk(
+                    chunk_id=f"{parent['paper_id']}_section_{parent_index}_chunk_{child_index}",
+                    paper_id=parent["paper_id"],
+                    file_name=parent["file_name"],
+                    page=first_page,
+                    text=chunk_text,
+                    page_start=first_page,
+                    page_end=last_page,
+                    page_numbers=",".join(str(value) for value in page_numbers),
+                    section_title=section.get("section_title", ""),
+                    subsection_title=section.get("subsection_title", ""),
+                    section_type=section.get("section_type", ""),
+                    section_path=section.get("section_path", ""),
+                    parent_id=parent_id,
+                    parent_index=parent_index,
+                    child_index=child_index,
+                )
+            )
 
     return all_chunks

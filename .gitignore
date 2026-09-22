@@ -20,6 +20,10 @@ storage/exports/*
 data/benchmarks/
 storage/evals/*
 !storage/evals/.gitkeep
+storage/*.db
+storage/*.db-wal
+storage/*.db-shm
+storage/arxiv_mcp/
 tmp/
 tmp_reference/
 rag_storage/

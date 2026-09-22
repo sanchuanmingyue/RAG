@@ -1,0 +1,72 @@
+{"id":"qa-01","query":"这篇论文采用了什么训练方法？","expected_intent":"qa"}
+{"id":"qa-02","query":"作者为什么选择这个数据集？","expected_intent":"qa"}
+{"id":"qa-03","query":"模型的准确率是多少？","expected_intent":"qa"}
+{"id":"qa-04","query":"消融实验中移除检索模块后发生了什么？","expected_intent":"qa"}
+{"id":"qa-05","query":"方法里的损失函数是如何定义的？","expected_intent":"qa"}
+{"id":"qa-06","query":"What optimization algorithm does the paper use?","expected_intent":"qa"}
+{"id":"qa-07","query":"这些论文分别采用了什么方法？","expected_intent":"qa"}
+{"id":"summary-01","query":"总结这篇论文","expected_intent":"summary"}
+{"id":"summary-02","query":"概括一下文章的核心内容","expected_intent":"summary"}
+{"id":"summary-03","query":"生成这篇论文的阅读笔记","expected_intent":"summary"}
+{"id":"summary-04","query":"给我制作一张论文卡片","expected_intent":"summary"}
+{"id":"summary-05","query":"提取论文的创新点","expected_intent":"summary"}
+{"id":"summary-06","query":"整理这篇文章的实验设置","expected_intent":"summary"}
+{"id":"summary-07","query":"Summarize the main contribution of this paper","expected_intent":"summary"}
+{"id":"compare-01","query":"对比选中的两篇论文","expected_intent":"compare"}
+{"id":"compare-02","query":"比较这些方法的差异","expected_intent":"compare"}
+{"id":"compare-03","query":"这些论文有哪些共同点？","expected_intent":"compare"}
+{"id":"compare-04","query":"对多篇文章进行横向比较","expected_intent":"compare"}
+{"id":"compare-05","query":"生成一份文献综述","expected_intent":"compare"}
+{"id":"compare-06","query":"比较它们的实验结果和局限性","expected_intent":"compare"}
+{"id":"compare-07","query":"Compare the selected papers","expected_intent":"compare"}
+{"id":"source-01","query":"刚才回答的来源是什么？","expected_intent":"source_explain"}
+{"id":"source-02","query":"查看引用片段","expected_intent":"source_explain"}
+{"id":"source-03","query":"给出支持这个结论的证据","expected_intent":"source_explain"}
+{"id":"source-04","query":"对应的原文在哪里？","expected_intent":"source_explain"}
+{"id":"source-05","query":"告诉我具体页码","expected_intent":"source_explain"}
+{"id":"source-06","query":"这个答案的依据是什么？","expected_intent":"source_explain"}
+{"id":"source-07","query":"Show the source passages for the answer","expected_intent":"source_explain"}
+{"id":"export-01","query":"导出刚才的结果","expected_intent":"export"}
+{"id":"export-02","query":"把阅读笔记保存成 Markdown","expected_intent":"export"}
+{"id":"export-03","query":"下载当前分析","expected_intent":"export"}
+{"id":"export-04","query":"生成 JSON 文件","expected_intent":"export"}
+{"id":"export-05","query":"导出多篇论文的对比结果","expected_intent":"export"}
+{"id":"export-06","query":"将会话保存到文件","expected_intent":"export"}
+{"id":"export-07","query":"Export the latest result as JSON","expected_intent":"export"}
+{"id":"library-01","query":"当前库中有多少篇文章？","expected_intent":"library_status"}
+{"id":"library-02","query":"列出知识库里已索引的文件","expected_intent":"library_status"}
+{"id":"library-03","query":"向量库现在有多少 chunks？","expected_intent":"library_status"}
+{"id":"library-04","query":"知识库状态怎么样？","expected_intent":"library_status"}
+{"id":"library-05","query":"当前库里有哪些论文？","expected_intent":"library_status"}
+{"id":"library-06","query":"我上传了几篇论文？","expected_intent":"library_status"}
+{"id":"library-07","query":"List the files in the current collection","expected_intent":"library_status"}
+{"id":"search-01","query":"帮我查找近三年关于多模态 RAG 的论文","expected_intent":"literature_search"}
+{"id":"search-02","query":"搜索一些图神经网络相关文献","expected_intent":"literature_search"}
+{"id":"search-03","query":"推荐几篇联邦学习领域的文章","expected_intent":"literature_search"}
+{"id":"search-04","query":"在 IEEE 中找关于智能电网的论文","expected_intent":"literature_search"}
+{"id":"search-05","query":"检索 arXiv 上最新的 Agent 论文","expected_intent":"literature_search"}
+{"id":"search-06","query":"find papers about retrieval augmented generation","expected_intent":"literature_search"}
+{"id":"search-07","query":"帮我搜一下大语言模型幻觉检测相关的研究文章","expected_intent":"literature_search"}
+{"id":"corpus-01","query":"对这83篇文章按研究背景分类","expected_intent":"corpus_analysis"}
+{"id":"corpus-02","query":"把知识库中所有论文分成5类","expected_intent":"corpus_analysis"}
+{"id":"corpus-03","query":"将当前库里的文献按方法进行聚类","expected_intent":"corpus_analysis"}
+{"id":"corpus-04","query":"把这些论文按照研究主题分组","expected_intent":"corpus_analysis"}
+{"id":"corpus-05","query":"对全部文章进行归类","expected_intent":"corpus_analysis"}
+{"id":"corpus-06","query":"把这批文献划分成几个研究方向","expected_intent":"corpus_analysis"}
+{"id":"corpus-07","query":"Cluster all papers in the library by research topic","expected_intent":"corpus_analysis"}
+{"id":"ctx-01","query":"能不能再详细一点？","expected_intent":"qa","previous_intent":"qa","previous_query":"这篇论文的方法是什么？","previous_answer_summary":"论文采用检索增强方法。","expected_is_followup":true}
+{"id":"ctx-02","query":"为什么？","expected_intent":"qa","previous_intent":"qa","previous_query":"作者使用了对比学习吗？","previous_answer_summary":"作者使用了对比学习。","expected_is_followup":true}
+{"id":"ctx-03","query":"这个方法如何实现？","expected_intent":"qa","previous_intent":"qa","previous_query":"论文的核心方法是什么？","previous_answer_summary":"核心方法是分层检索。","expected_is_followup":true}
+{"id":"ctx-04","query":"再详细一点","expected_intent":"summary","previous_intent":"summary","previous_query":"总结这篇论文","previous_answer_summary":"已生成阅读笔记。","expected_is_followup":true}
+{"id":"ctx-05","query":"前者为什么表现更好呢？","expected_intent":"compare","previous_intent":"compare","previous_query":"比较论文 A 和论文 B","previous_answer_summary":"论文 A 的准确率更高。","expected_is_followup":true}
+{"id":"ctx-06","query":"再找近两年的","expected_intent":"literature_search","previous_intent":"literature_search","previous_query":"搜索多模态 RAG 论文","previous_answer_summary":"找到了十篇相关论文。","expected_is_followup":true}
+{"id":"ctx-07","query":"那具体有哪些？","expected_intent":"library_status","previous_intent":"library_status","previous_query":"当前库有多少篇论文？","previous_answer_summary":"当前共 83 篇。","expected_is_followup":true}
+{"id":"ctx-08","query":"第2类有哪些论文？","expected_intent":"corpus_analysis","previous_intent":"corpus_analysis","previous_query":"把全部论文分类","previous_answer_summary":"已分为四类。","active_artifact_type":"corpus_analysis","expected_is_followup":true}
+{"id":"ctx-09","query":"把第3类再分成两组","expected_intent":"corpus_analysis","previous_intent":"corpus_analysis","previous_query":"把全部论文分类","previous_answer_summary":"已分为四类。","active_artifact_type":"corpus_analysis","expected_is_followup":true}
+{"id":"ctx-10","query":"为什么这样分类？","expected_intent":"corpus_analysis","previous_intent":"corpus_analysis","previous_query":"把全部论文分类","previous_answer_summary":"已分为四类。","active_artifact_type":"corpus_analysis","expected_is_followup":true}
+{"id":"ctx-11","query":"每类展开介绍一下","expected_intent":"corpus_analysis","previous_intent":"corpus_analysis","previous_query":"把全部论文分类","previous_answer_summary":"已分为四类。","active_artifact_type":"corpus_analysis","expected_is_followup":true}
+{"id":"ctx-12","query":"导出刚才的分类结果","expected_intent":"export","previous_intent":"corpus_analysis","previous_query":"把全部论文分类","previous_answer_summary":"已分为四类。","active_artifact_type":"corpus_analysis","expected_is_followup":false}
+{"id":"ctx-13","query":"帮我搜索其他相关论文","expected_intent":"literature_search","previous_intent":"qa","previous_query":"这篇论文的方法是什么？","previous_answer_summary":"核心方法是混合检索。","expected_is_followup":false}
+{"id":"ctx-14","query":"总结当前这篇论文","expected_intent":"summary","previous_intent":"literature_search","previous_query":"搜索多模态论文","previous_answer_summary":"找到了相关论文。","expected_is_followup":false}
+{"id":"ctx-15","query":"当前知识库有多少篇论文？","expected_intent":"library_status","previous_intent":"compare","previous_query":"比较这两篇论文","previous_answer_summary":"已完成比较。","expected_is_followup":false}
+{"id":"ctx-16","query":"现在解释刚才的证据来源","expected_intent":"source_explain","previous_intent":"qa","previous_query":"论文结论是什么？","previous_answer_summary":"模型在测试集上提升明显。","expected_is_followup":false}

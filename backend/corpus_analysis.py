@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 from sklearn.cluster import KMeans
@@ -37,15 +38,25 @@ class CorpusAnalysisService:
         self.vector_store = vector_store
         self.llm_client = llm_client
 
-    def classify_by_background(self, request: str) -> dict[str, Any]:
+    def classify_by_background(
+        self,
+        request: str,
+        *,
+        paper_ids: set[str] | None = None,
+        category_count: int | None = None,
+    ) -> dict[str, Any]:
         profiles = self.vector_store.get_corpus_background_profiles()
+        if paper_ids is not None:
+            profiles = [profile for profile in profiles if profile["paper_id"] in paper_ids]
         if len(profiles) < 2:
             raise ValueError("至少需要两篇已建立章节向量的论文才能进行全库分类。")
 
         matrix = np.asarray([profile["embedding"] for profile in profiles], dtype=np.float32)
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         matrix = matrix / np.maximum(norms, 1e-12)
-        requested = requested_category_count(request)
+        requested = requested_category_count(request) or category_count
+        if requested is not None:
+            requested = min(max(requested, 2), max(len(profiles) - 1, 2))
         category_count, labels, silhouette = self._cluster(matrix, requested)
         keywords = self._cluster_keywords(profiles, labels, category_count)
         representatives = self._representatives(profiles, matrix, labels, category_count)
@@ -75,6 +86,7 @@ class CorpusAnalysisService:
         for index, category in enumerate(categories, start=1):
             category["rank"] = index
         return {
+            "artifact_id": f"corpus_cls_{uuid4().hex[:10]}",
             "analysis_type": "research_background_classification",
             "paper_count": len(profiles),
             "category_count": category_count,
