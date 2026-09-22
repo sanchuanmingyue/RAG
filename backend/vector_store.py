@@ -7,6 +7,7 @@ import re
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from hashlib import sha1
+from threading import RLock, local
 from time import perf_counter
 from typing import Any, Callable
 
@@ -62,11 +63,51 @@ class ChromaVectorStore:
         self._keyword_postings: dict[str, list[tuple[int, int]]] = {}
         self._keyword_doc_frequency: Counter[str] = Counter()
         self._keyword_query_cache: OrderedDict[str, dict[int, float]] = OrderedDict()
+        self._keyword_lock = RLock()
         self._paper_list_cache: list[dict[str, Any]] | None = None
         self.section_reranker = SectionReranker()
+        self._query_timings_local = local()
         self.last_query_timings_ms: dict[str, float] = {}
         self._last_vector_timings_ms: dict[str, float] = {}
         self._last_keyword_timings_ms: dict[str, float] = {}
+
+    @property
+    def last_query_timings_ms(self) -> dict[str, float]:
+        """Latest timings for the current thread.
+
+        Deep retrieval runs independent query facets concurrently.  Thread-local
+        timing state prevents one facet from overwriting another before the
+        caller aggregates their measurements.
+        """
+
+        return getattr(self._timing_state(), "last_query", {})
+
+    @last_query_timings_ms.setter
+    def last_query_timings_ms(self, value: dict[str, float]) -> None:
+        self._timing_state().last_query = value
+
+    @property
+    def _last_vector_timings_ms(self) -> dict[str, float]:
+        return getattr(self._timing_state(), "vector", {})
+
+    @_last_vector_timings_ms.setter
+    def _last_vector_timings_ms(self, value: dict[str, float]) -> None:
+        self._timing_state().vector = value
+
+    @property
+    def _last_keyword_timings_ms(self) -> dict[str, float]:
+        return getattr(self._timing_state(), "keyword", {})
+
+    @_last_keyword_timings_ms.setter
+    def _last_keyword_timings_ms(self, value: dict[str, float]) -> None:
+        self._timing_state().keyword = value
+
+    def _timing_state(self):
+        state = self.__dict__.get("_query_timings_local")
+        if state is None:
+            state = local()
+            self.__dict__["_query_timings_local"] = state
+        return state
 
     def index_chunks(
         self,
@@ -381,6 +422,30 @@ class ChromaVectorStore:
         return hits
 
     def keyword_query(
+        self,
+        query_text: str,
+        top_k: int = 20,
+        paper_id: str | None = None,
+        paper_ids: list[str] | None = None,
+        section_types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        # The in-memory BM25 index is shared across retrieval facets.  Keep its
+        # LRU mutations deterministic while vector and remote rerank work remain
+        # free to run concurrently.
+        keyword_lock = getattr(self, "_keyword_lock", None)
+        if keyword_lock is None:
+            keyword_lock = RLock()
+            self._keyword_lock = keyword_lock
+        with keyword_lock:
+            return self._keyword_query_locked(
+                query_text,
+                top_k=top_k,
+                paper_id=paper_id,
+                paper_ids=paper_ids,
+                section_types=section_types,
+            )
+
+    def _keyword_query_locked(
         self,
         query_text: str,
         top_k: int = 20,

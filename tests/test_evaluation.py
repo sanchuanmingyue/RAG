@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import tempfile
+from threading import Lock
+import time
 import unittest
+from unittest.mock import patch
 
+from backend.config import settings
 from backend.evaluation import (
     BenchmarkCase,
     EvaluationConfig,
@@ -517,6 +521,37 @@ class EvaluationMetricsTests(unittest.TestCase):
         self.assertTrue(result["evidence_plan_used"])
         self.assertEqual(result["max_output_tokens"], 333)
 
+    def test_single_paper_switch_can_keep_detailed_wording_in_fast_mode(self) -> None:
+        class FakeConfig:
+            qa_planning_enabled = True
+            qa_plan_max_tokens = 77
+            qa_long_max_tokens = 333
+            qa_max_tokens = 50
+            qa_auto_continue = False
+
+        class FakeClient:
+            config = FakeConfig()
+            last_chat_metadata = {"finish_reason": "stop"}
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def chat(self, messages, temperature=0.2, max_tokens=None, **kwargs):
+                self.calls.append({"messages": messages, "max_tokens": max_tokens})
+                return "快速回答 [S1]"
+
+        client = FakeClient()
+        result = PaperRAG(object(), client).answer_from_hits(  # type: ignore[arg-type]
+            "详细解释这篇论文的方法",
+            [{"text": "Method evidence.", "metadata": {}}],
+            deep_mode=False,
+        )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["max_tokens"], 50)
+        self.assertFalse(result["long_form"])
+        self.assertFalse(result["evidence_plan_used"])
+
     def test_long_form_qa_continues_once_after_length_finish(self) -> None:
         class FakeConfig:
             qa_planning_enabled = False
@@ -563,7 +598,7 @@ class EvaluationMetricsTests(unittest.TestCase):
                 self.last_query_timings_ms = {"total_ms": 1.0}
                 return [
                     {
-                        "text": f"evidence {index}",
+                        "text": query,
                         "metadata": {
                             "paper_id": "p1",
                             "parent_id": f"section-{index}",
@@ -581,7 +616,49 @@ class EvaluationMetricsTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(store.queries), 5)
         self.assertGreaterEqual(len(hits), 5)
-        self.assertIn("逐章详细介绍", store.queries[-1])
+        self.assertTrue(any("逐章详细介绍" in query for query in store.queries))
+        self.assertIn("逐章详细介绍", hits[-1]["text"])
+
+    def test_deep_retrieval_runs_facets_concurrently(self) -> None:
+        class ConcurrentStore:
+            def __init__(self) -> None:
+                self.lock = Lock()
+                self.active = 0
+                self.max_active = 0
+                self.last_query_timings_ms = {}
+
+            def query(self, **kwargs):
+                query = kwargs["query_text"]
+                with self.lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                try:
+                    time.sleep(0.03)
+                    self.last_query_timings_ms = {"total_ms": 30.0}
+                    return [
+                        {
+                            "text": query,
+                            "metadata": {
+                                "paper_id": "p1",
+                                "parent_id": query,
+                                "section_type": "method",
+                            },
+                        }
+                    ]
+                finally:
+                    with self.lock:
+                        self.active -= 1
+
+        store = ConcurrentStore()
+        with patch.object(settings, "qa_retrieval_workers", 4):
+            hits, _analysis = PaperRAG(store, object()).retrieve_hits(  # type: ignore[arg-type]
+                "请详细介绍这篇论文的方法",
+                paper_id="p1",
+                top_k=12,
+            )
+
+        self.assertGreaterEqual(store.max_active, 2)
+        self.assertIn("请详细介绍", hits[-1]["text"])
 
     def test_suspicious_binary_comparison_gets_one_consistency_retry(self) -> None:
         class FakeClient:

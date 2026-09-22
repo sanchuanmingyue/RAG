@@ -19,7 +19,7 @@ class RetrieveRequest(BaseModel):
 
 
 class ChatRequest(RetrieveRequest):
-    pass
+    deep_mode: bool | None = None
 
 
 class SummaryRequest(BaseModel):

@@ -144,9 +144,16 @@ class PaperService:
         retrieval_question: str | None = None,
         retrieval_mode: str | None = None,
         expand_parent: bool | None = None,
+        deep_mode: bool | None = None,
     ) -> dict[str, Any]:
         started = perf_counter()
-        resolved_top_k = self._resolve_top_k(paper_id, top_k, question)
+        resolved_deep_mode = PaperRAG.resolve_deep_mode(question, paper_id, deep_mode)
+        resolved_top_k = self._resolve_top_k(
+            paper_id,
+            top_k,
+            question,
+            deep_mode=resolved_deep_mode,
+        )
         with self._operation_lock:
             result = PaperRAG(self.vector_store, self.llm_client).answer(
                 question,
@@ -155,6 +162,7 @@ class PaperService:
                 retrieval_question=retrieval_question,
                 retrieval_mode=retrieval_mode,
                 expand_parent=expand_parent,
+                deep_mode=resolved_deep_mode,
             )
             result["retrieval_timings_ms"] = dict(self.vector_store.last_query_timings_ms)
         total_ms = (perf_counter() - started) * 1000
@@ -176,13 +184,28 @@ class PaperService:
         retrieval_question: str | None = None,
         retrieval_mode: str | None = None,
         expand_parent: bool | None = None,
+        deep_mode: bool | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Retrieve under the store lock, then stream generation without it."""
 
         started = perf_counter()
-        resolved_top_k = self._resolve_top_k(paper_id, top_k, question)
+        resolved_deep_mode = PaperRAG.resolve_deep_mode(question, paper_id, deep_mode)
+        resolved_top_k = self._resolve_top_k(
+            paper_id,
+            top_k,
+            question,
+            deep_mode=resolved_deep_mode,
+        )
         rag = PaperRAG(self.vector_store, self.llm_client)
         resolved_question = retrieval_question or question
+        yield {
+            "event": "stage",
+            "data": {
+                "stage": "retrieving",
+                "label": "检索中",
+                "message": "正在从论文中查找相关证据…",
+            },
+        }
         with self._operation_lock:
             hits, retrieval_analysis = rag.retrieve_hits(
                 resolved_question,
@@ -190,6 +213,7 @@ class PaperService:
                 top_k=resolved_top_k,
                 retrieval_mode=retrieval_mode,
                 expand_parent=expand_parent,
+                deep_mode=resolved_deep_mode,
             )
             timings = dict(self.vector_store.last_query_timings_ms)
         retrieved_at = perf_counter()
@@ -206,6 +230,7 @@ class PaperService:
             hits,
             analysis=analysis,
             resolved_question=resolved_question if retrieval_question else None,
+            deep_mode=resolved_deep_mode,
         ):
             if event["event"] in {"meta", "done"}:
                 event["data"]["retrieval_timings_ms"] = timings
@@ -224,10 +249,17 @@ class PaperService:
         paper_id: str | None,
         top_k: int | None,
         question: str | None = None,
+        *,
+        deep_mode: bool | None = None,
     ) -> int:
         if top_k is not None:
             return top_k
-        if paper_id and question and is_long_form_question(question):
+        resolved_deep_mode = (
+            is_long_form_question(question or "")
+            if deep_mode is None
+            else bool(deep_mode)
+        )
+        if paper_id and resolved_deep_mode:
             return max(settings.qa_detailed_top_k, settings.retrieval_top_k)
         return settings.retrieval_top_k if paper_id else settings.multi_paper_top_k
 

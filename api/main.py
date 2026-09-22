@@ -239,6 +239,7 @@ async def chat(payload: ChatRequest, container: APIContainer = Depends(_get_cont
             top_k=payload.top_k,
             retrieval_mode=payload.retrieval_mode,
             expand_parent=payload.expand_parent,
+            deep_mode=payload.deep_mode,
         )
     except Exception as exc:
         raise _translate_operation_error(exc) from exc
@@ -298,6 +299,7 @@ async def chat_stream(payload: ChatRequest, container: APIContainer = Depends(_g
                 top_k=payload.top_k,
                 retrieval_mode=payload.retrieval_mode,
                 expand_parent=payload.expand_parent,
+                deep_mode=payload.deep_mode,
             ):
                 yield _sse(item["event"], item["data"])
         except Exception as exc:

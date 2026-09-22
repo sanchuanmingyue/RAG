@@ -56,6 +56,7 @@ class OpenAICompatibleClient:
         # Keep the previous attribute for callers that only used the chat SDK.
         self.client = self.chat_client
         self._query_embedding_cache: OrderedDict[str, list[float]] = OrderedDict()
+        self._query_embedding_cache_lock = RLock()
         self._model_cooldowns: dict[str, float] = {}
         self._model_pool_lock = RLock()
         self.last_chat_metadata: dict[str, Any] = {}
@@ -155,16 +156,18 @@ class OpenAICompatibleClient:
         if not normalized:
             raise ValueError("query text must not be empty")
 
-        cached = self._query_embedding_cache.pop(normalized, None)
-        if cached is not None:
-            self._query_embedding_cache[normalized] = cached
-            return cached
+        with self._query_embedding_cache_lock:
+            cached = self._query_embedding_cache.pop(normalized, None)
+            if cached is not None:
+                self._query_embedding_cache[normalized] = cached
+                return cached
 
         embedding = self.embed_texts([normalized])[0]
         if self.config.query_embedding_cache_size > 0:
-            self._query_embedding_cache[normalized] = embedding
-            while len(self._query_embedding_cache) > self.config.query_embedding_cache_size:
-                self._query_embedding_cache.popitem(last=False)
+            with self._query_embedding_cache_lock:
+                self._query_embedding_cache[normalized] = embedding
+                while len(self._query_embedding_cache) > self.config.query_embedding_cache_size:
+                    self._query_embedding_cache.popitem(last=False)
         return embedding
 
     def chat(

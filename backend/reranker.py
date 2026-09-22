@@ -46,6 +46,7 @@ class SiliconFlowSectionReranker:
 
     def __init__(self, client: Any | None = None) -> None:
         self._client = client
+        self._client_lock = RLock()
         self._error = ""
 
     @property
@@ -94,11 +95,13 @@ class SiliconFlowSectionReranker:
 
     def _get_client(self) -> Any:
         if self._client is None:
-            self._client = httpx.Client(
-                base_url=settings.reranker_base_url.rstrip("/"),
-                headers={"Authorization": f"Bearer {settings.reranker_api_key}"},
-                timeout=settings.reranker_timeout_seconds,
-            )
+            with self._client_lock:
+                if self._client is None:
+                    self._client = httpx.Client(
+                        base_url=settings.reranker_base_url.rstrip("/"),
+                        headers={"Authorization": f"Bearer {settings.reranker_api_key}"},
+                        timeout=settings.reranker_timeout_seconds,
+                    )
         return self._client
 
 

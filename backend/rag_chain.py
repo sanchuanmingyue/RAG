@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from collections.abc import Iterator
+from time import perf_counter
 from typing import Any
 
 from backend.config import settings
@@ -14,7 +16,6 @@ from backend.prompts import (
     build_evidence_plan_messages,
     build_qa_messages,
     is_long_form_question,
-    is_multi_paper_question,
     is_yes_no_question,
 )
 from backend.vector_store import ChromaVectorStore
@@ -549,10 +550,12 @@ class PaperRAG:
         question: str,
         hits: list[dict[str, Any]],
         prompt_question: str,
+        *,
+        deep_mode: bool | None = None,
     ) -> tuple[list[dict[str, str]], bool, bool]:
         """Create a private evidence outline before complex synthesis."""
 
-        long_form = is_long_form_question(question)
+        long_form = is_long_form_question(question) if deep_mode is None else bool(deep_mode)
         evidence_plan = ""
         client_config = getattr(self.llm_client, "config", None)
         planning_enabled = bool(
@@ -652,7 +655,9 @@ class PaperRAG:
         temperature: float = 0.2,
         long_form: bool = False,
     ) -> Iterator[str]:
-        qa_stream = getattr(self.llm_client, "chat_stream_qa", self.llm_client.chat_stream)
+        qa_stream = getattr(self.llm_client, "chat_stream_qa", None)
+        if qa_stream is None:
+            qa_stream = self.llm_client.chat_stream
         try:
             yield from qa_stream(
                 messages,
@@ -711,9 +716,11 @@ class PaperRAG:
         retrieval_question: str | None = None,
         retrieval_mode: str | None = None,
         expand_parent: bool | None = None,
+        deep_mode: bool | None = None,
     ) -> dict[str, Any]:
         """Return an answer and source chunks, using section-aware fallback."""
 
+        resolved_deep_mode = self.resolve_deep_mode(question, paper_id, deep_mode)
         resolved_question = retrieval_question or question
         hits, retrieval_analysis = self.retrieve_hits(
             resolved_question,
@@ -721,6 +728,7 @@ class PaperRAG:
             top_k=top_k,
             retrieval_mode=retrieval_mode,
             expand_parent=expand_parent,
+            deep_mode=resolved_deep_mode,
         )
         analysis = QueryAnalysis(
             original_question=question,
@@ -733,7 +741,27 @@ class PaperRAG:
             hits,
             analysis=analysis,
             resolved_question=resolved_question if retrieval_question else None,
+            deep_mode=resolved_deep_mode,
         )
+
+    @staticmethod
+    def resolve_deep_mode(
+        question: str,
+        paper_id: str | None,
+        deep_mode: bool | None = None,
+    ) -> bool:
+        """Resolve the QA profile while always protecting multi-paper synthesis.
+
+        A caller-provided switch controls single-paper QA.  Corpus-wide QA always
+        keeps the complete retrieval and evidence-planning path.  Callers that do
+        not yet expose a switch retain the historical intent-based behavior.
+        """
+
+        if paper_id is None:
+            return True
+        if deep_mode is not None:
+            return bool(deep_mode)
+        return is_long_form_question(question)
 
     def retrieve_hits(
         self,
@@ -743,17 +771,18 @@ class PaperRAG:
         *,
         retrieval_mode: str | None = None,
         expand_parent: bool | None = None,
+        deep_mode: bool | None = None,
     ) -> tuple[list[dict[str, Any]], QueryAnalysis]:
         """Retrieve once and return both hits and the analysis used for them."""
 
         analysis = analyze_question(question)
+        deep_retrieval = self.resolve_deep_mode(question, paper_id, deep_mode)
         retrieval_top_k = top_k if top_k is not None else (
             max(settings.qa_detailed_top_k, settings.retrieval_top_k)
-            if paper_id and is_long_form_question(question)
+            if paper_id and deep_retrieval
             else settings.retrieval_top_k if paper_id else settings.multi_paper_top_k
         )
-        multi_paper = paper_id is None and is_multi_paper_question(question)
-        deep_retrieval = is_long_form_question(question)
+        multi_paper = paper_id is None
         query_top_k = retrieval_top_k * 2 if multi_paper and not deep_retrieval else retrieval_top_k
         queries = _deep_retrieval_queries(question, analysis) if deep_retrieval else [analysis.rewritten_query]
         per_query_top_k = (
@@ -763,7 +792,9 @@ class PaperRAG:
         )
         result_groups: list[list[dict[str, Any]]] = []
         timing_totals: dict[str, float] = {}
-        for retrieval_query in queries:
+        retrieval_batch_started = perf_counter()
+
+        def retrieve_one(retrieval_query: str) -> tuple[list[dict[str, Any]], dict[str, float]]:
             query_hits = self.vector_store.query(
                 query_text=retrieval_query,
                 embedding_client=self.llm_client,
@@ -774,10 +805,37 @@ class PaperRAG:
                 expand_parent=expand_parent,
                 diversify_papers=multi_paper,
             )
+            query_timings = dict(
+                getattr(self.vector_store, "last_query_timings_ms", {}) or {}
+            )
+            return query_hits, query_timings
+
+        worker_count = min(
+            len(queries),
+            max(int(getattr(settings, "qa_retrieval_workers", 1)), 1),
+        )
+        if deep_retrieval and worker_count > 1:
+            # executor.map preserves the facet order even when requests finish in
+            # a different order, keeping merge and citation behavior deterministic.
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="rag-retrieval",
+            ) as executor:
+                query_results = list(executor.map(retrieve_one, queries))
+        else:
+            query_results = [retrieve_one(retrieval_query) for retrieval_query in queries]
+
+        facet_total_ms = 0.0
+        for query_hits, query_timings in query_results:
             result_groups.append(query_hits)
-            for name, value in (getattr(self.vector_store, "last_query_timings_ms", {}) or {}).items():
+            for name, value in query_timings.items():
                 if isinstance(value, (int, float)):
-                    timing_totals[name] = timing_totals.get(name, 0.0) + float(value)
+                    if name == "total_ms":
+                        facet_total_ms += float(value)
+                    else:
+                        timing_totals[name] = timing_totals.get(name, 0.0) + float(value)
+        timing_totals["facet_total_ms"] = facet_total_ms
+        timing_totals["total_ms"] = (perf_counter() - retrieval_batch_started) * 1000
         hits = _round_robin_unique_hits(
             result_groups,
             retrieval_top_k * 2 if multi_paper else retrieval_top_k,
@@ -815,6 +873,7 @@ class PaperRAG:
         *,
         analysis: QueryAnalysis | None = None,
         resolved_question: str | None = None,
+        deep_mode: bool | None = None,
     ) -> dict[str, Any]:
         """Generate from already-retrieved hits so evaluation does not retrieve twice."""
 
@@ -835,6 +894,7 @@ class PaperRAG:
             question,
             hits,
             prompt_question,
+            deep_mode=deep_mode,
         )
         max_tokens = self._qa_token_limit(long_form)
         raw_answer = self._chat_qa(messages, max_tokens=max_tokens, long_form=long_form)
@@ -975,6 +1035,7 @@ class PaperRAG:
         *,
         analysis: QueryAnalysis | None = None,
         resolved_question: str | None = None,
+        deep_mode: bool | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield answer deltas followed by one authoritative final result."""
 
@@ -994,13 +1055,30 @@ class PaperRAG:
             }
             return
 
+        yield {
+            "event": "stage",
+            "data": {
+                "stage": "reranking",
+                "label": "重排中",
+                "message": "正在筛选证据并组织回答结构…",
+            },
+        }
         prompt_question = self._prompt_question(question, resolved_question)
         messages, long_form, evidence_plan_used = self._prepare_generation(
             question,
             hits,
             prompt_question,
+            deep_mode=deep_mode,
         )
         max_tokens = self._qa_token_limit(long_form)
+        yield {
+            "event": "stage",
+            "data": {
+                "stage": "generating",
+                "label": "生成中",
+                "message": "正在根据论文证据生成回答…",
+            },
+        }
         yield {
             "event": "meta",
             "data": {

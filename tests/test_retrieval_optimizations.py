@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import unittest
 from collections import Counter, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 from backend.reranker import CrossEncoderSectionReranker, SiliconFlowSectionReranker
 from backend.text_splitter import TextChunk
@@ -13,6 +15,21 @@ from backend.vector_store import ChromaVectorStore, _tokenize
 
 
 class RetrievalOptimizationTests(unittest.TestCase):
+    def test_query_timings_are_isolated_per_retrieval_thread(self) -> None:
+        store = ChromaVectorStore.__new__(ChromaVectorStore)
+        store.last_query_timings_ms = {}
+
+        def record(value: float) -> float:
+            store.last_query_timings_ms = {"total_ms": value}
+            time.sleep(0.01)
+            return store.last_query_timings_ms["total_ms"]
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            recorded = list(executor.map(record, [1.0, 2.0, 3.0]))
+
+        self.assertEqual(recorded, [1.0, 2.0, 3.0])
+        self.assertEqual(store.last_query_timings_ms, {})
+
     def test_section_index_uses_mean_chunk_embedding(self) -> None:
         captured = {}
 

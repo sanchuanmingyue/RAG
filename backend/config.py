@@ -105,6 +105,7 @@ class Settings:
         self.qa_long_models = _env_list("QA_LONG_MODELS", "") or self.llm_models
         self.qa_long_enable_thinking = _env_bool("QA_LONG_ENABLE_THINKING", False)
         self.qa_detailed_top_k = int(os.getenv("QA_DETAILED_TOP_K", "12"))
+        self.qa_retrieval_workers = max(int(os.getenv("QA_RETRIEVAL_WORKERS", "4")), 1)
         self.qa_planning_enabled = _env_bool("QA_PLANNING_ENABLED", True)
         self.qa_plan_max_tokens = int(os.getenv("QA_PLAN_MAX_TOKENS", "900"))
         self.qa_auto_continue = _env_bool("QA_AUTO_CONTINUE", True)

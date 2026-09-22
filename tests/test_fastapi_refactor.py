@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from api.main import create_app
 from backend.config import Settings, settings
 from backend.embeddings import OpenAICompatibleClient
+from backend.rag_chain import PaperRAG
 from backend.services import AgentSessionStore, BackgroundTaskManager, PaperService
 from backend.rag_anything_reader import (
     RagAnythingPaperReader,
@@ -46,6 +47,10 @@ class _FakePaperService:
         return self.vector_store.count_chunks()
 
     def answer_stream(self, question, **kwargs):
+        yield {
+            "event": "stage",
+            "data": {"stage": "retrieving", "label": "检索中"},
+        }
         yield {"event": "meta", "data": {"source_count": 1}}
         yield {"event": "delta", "data": {"text": "答案 [S1]"}}
         yield {"event": "done", "data": {"answer": "答案 [S1]", "sources": []}}
@@ -446,6 +451,54 @@ class FastAPIRefactorTests(unittest.TestCase):
             ],
         )
 
+    def test_single_paper_deep_switch_overrides_keyword_detection(self) -> None:
+        self.assertFalse(
+            PaperRAG.resolve_deep_mode("请详细介绍这篇论文", "p1", deep_mode=False)
+        )
+        self.assertTrue(PaperRAG.resolve_deep_mode("核心方法是什么", "p1", deep_mode=True))
+        self.assertTrue(PaperRAG.resolve_deep_mode("这些论文讲了什么", None, deep_mode=False))
+        self.assertEqual(
+            PaperService._resolve_top_k(
+                "p1",
+                None,
+                "请详细介绍这篇论文",
+                deep_mode=False,
+            ),
+            settings.retrieval_top_k,
+        )
+
+    def test_stream_exposes_retrieval_reranking_and_generation_stages(self) -> None:
+        class FakeConfig:
+            qa_planning_enabled = False
+            qa_max_tokens = 50
+            qa_long_max_tokens = 100
+            qa_auto_continue = False
+
+        class FakeClient:
+            config = FakeConfig()
+            last_chat_metadata = {"finish_reason": "stop", "model_used": "fake"}
+
+            def chat_stream_qa(self, messages, **kwargs):
+                yield "答案 [S1]"
+
+        service = PaperService(
+            vector_store=_FakeVectorStore(),
+            llm_client=FakeClient(),  # type: ignore[arg-type]
+        )
+
+        events = list(
+            service.answer_stream("核心方法是什么", paper_id="p1", deep_mode=False)
+        )
+
+        stages = [
+            event["data"]["stage"]
+            for event in events
+            if event["event"] == "stage"
+        ]
+        self.assertEqual(stages, ["retrieving", "reranking", "generating"])
+        self.assertEqual(events[-1]["event"], "done")
+        self.assertFalse(events[-1]["data"]["long_form"])
+
     def test_agent_sessions_are_isolated(self) -> None:
         sessions = AgentSessionStore()
         with sessions.session("a") as memory:
@@ -518,6 +571,7 @@ class FastAPIRefactorTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.headers["content-type"].startswith("text/event-stream"))
+        self.assertLess(response.text.index("event: stage"), response.text.index("event: meta"))
         self.assertLess(response.text.index("event: meta"), response.text.index("event: delta"))
         self.assertLess(response.text.index("event: delta"), response.text.index("event: done"))
 

@@ -560,7 +560,12 @@ def render_information_panel(
     with st.container(height=830, border=True, key="information_panel"):
         st.markdown('<div class="rag-info-title">信息面板</div>', unsafe_allow_html=True)
         scope_label = "当前论文" if memory.current_paper_id else "全部论文"
-        mode_label = "多模态" if st.session_state.get("multimodal_chat_enabled") else "文本 RAG"
+        if st.session_state.get("multimodal_chat_enabled"):
+            mode_label = "多模态"
+        elif memory.current_paper_id is None or st.session_state.get("single_paper_deep_enabled"):
+            mode_label = "深度思考"
+        else:
+            mode_label = "快速问答"
         st.markdown(
             f'<div class="rag-info-subtitle">{scope_label} · {mode_label} · '
             f'{len(sources)} 条可核验证据</div>',
@@ -659,8 +664,24 @@ def render_chat_panel(paper_id: str | None, has_papers: bool) -> None:
     if st.session_state.pop("clear_workspace_question", False):
         st.session_state.workspace_question = ""
 
-    title_col, mode_col, action_col = st.columns([2.65, 1.55, 0.9])
+    multi_paper_qa = bool(has_papers and paper_id is None)
+    title_col, deep_col, mode_col, action_col = st.columns([2.1, 1.45, 1.25, 0.8])
     title_col.subheader("论文助手")
+    with deep_col:
+        if multi_paper_qa:
+            deep_enabled = st.toggle(
+                "深度思考",
+                value=True,
+                disabled=True,
+                key="multi_paper_deep_indicator",
+                help="多篇论文问答会自动执行完整检索与证据规划。",
+            )
+        else:
+            deep_enabled = st.toggle(
+                "深度思考",
+                key="single_paper_deep_enabled",
+                help="单篇论文开启后，将执行多角度检索、证据规划和长回答。",
+            )
     with mode_col:
         multimodal_enabled = st.toggle(
             "多模态",
@@ -683,6 +704,10 @@ def render_chat_panel(paper_id: str | None, has_papers: bool) -> None:
                 label="打开多模态索引管理",
                 width="stretch",
             )
+    elif multi_paper_qa:
+        st.caption("当前为多篇论文范围：已自动开启深度思考和完整证据规划。")
+    elif deep_enabled:
+        st.caption("深度思考已启用：将扩大检索范围并先规划证据，再生成详细回答。")
 
     with st.container(height=610, border=True, key="chat_history"):
         if not st.session_state.messages:
@@ -836,15 +861,23 @@ def render_chat_panel(paper_id: str | None, has_papers: bool) -> None:
                     else:
                         streamed_answer = ""
                         result = None
+                        progress_status = st.status("准备问答…", expanded=False)
                         try:
                             for event in get_paper_service().answer_stream(
                                 pending_question,
                                 paper_id=paper_id,
+                                deep_mode=deep_enabled,
                                 retrieval_question=(
                                     resolution.rewritten_query if resolution.is_followup else None
                                 ),
                             ):
-                                if event["event"] == "delta":
+                                if event["event"] == "stage":
+                                    stage_data = event.get("data") or {}
+                                    progress_status.update(
+                                        label=str(stage_data.get("message") or stage_data.get("label") or "处理中…"),
+                                        state="running",
+                                    )
+                                elif event["event"] == "delta":
                                     streamed_answer += event["data"].get("text", "")
                                     answer_placeholder.markdown(streamed_answer + "▌")
                                 elif event["event"] == "done":
@@ -852,13 +885,16 @@ def render_chat_panel(paper_id: str | None, has_papers: bool) -> None:
                                 elif event["event"] == "error":
                                     raise RuntimeError(event["data"].get("error", "流式回答失败"))
                         except Exception as exc:
+                            progress_status.update(label="问答失败", state="error")
                             st.session_state.pop("pending_question", None)
                             st.error(f"问答失败：{exc}")
                         else:
                             st.session_state.pop("pending_question", None)
                             if result is None:
+                                progress_status.update(label="问答失败", state="error")
                                 st.error("问答失败：生成服务没有返回最终结果。")
                             else:
+                                progress_status.update(label="回答完成", state="complete")
                                 if resolution.is_followup and resolution.rewritten_query:
                                     result["conversation_rewritten_query"] = resolution.rewritten_query
                                 answer_placeholder.markdown(result["answer"])
@@ -1029,9 +1065,18 @@ with st.sidebar:
             (paper["chunk_count"] for paper in papers if paper["file_name"] == selected_file),
             0,
         )
+        if selected_paper_id:
+            single_deep = bool(st.session_state.get("single_paper_deep_enabled"))
+            scope_summary = (
+                f"单篇深度 Top-{settings.qa_detailed_top_k}"
+                if single_deep
+                else f"单篇 Top-{settings.retrieval_top_k}"
+            )
+        else:
+            scope_summary = f"多篇深度 Top-{settings.multi_paper_top_k}"
         st.markdown(
             f'<div class="rag-file-status"><b>{selected_chunks}</b> chunks<br>'
-            f'<span>{"单篇 Top-5" if selected_paper_id else "多篇 Top-10"}</span></div>',
+            f'<span>{scope_summary}</span></div>',
             unsafe_allow_html=True,
         )
     else:
@@ -1081,10 +1126,18 @@ if navigation == "Chat":
     agent_memory.set_scope(selected_paper_id, selected_compare_ids)
     active_document = html.escape(selected_file or "未选择论文")
     active_scope = "当前论文" if selected_paper_id else "全部论文"
+    if st.session_state.get("multimodal_chat_enabled"):
+        workspace_mode = "多模态已开启"
+    elif selected_paper_id is None and papers:
+        workspace_mode = "深度思考 · 完整规划"
+    elif st.session_state.get("single_paper_deep_enabled"):
+        workspace_mode = "深度思考"
+    else:
+        workspace_mode = "快速问答 · 章节级混合检索"
     st.markdown(
         f'<div class="rag-workspace-bar"><div class="rag-workspace-title">{active_document}</div>'
         f'<div class="rag-workspace-meta">{active_scope} · '
-        f'{"多模态已开启" if st.session_state.get("multimodal_chat_enabled") else "章节级混合检索"}</div></div>',
+        f'{workspace_mode}</div></div>',
         unsafe_allow_html=True,
     )
     center, right = st.columns([1.55, 0.85], gap="medium")
